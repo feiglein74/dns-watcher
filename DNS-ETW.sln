@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DnsClientWatcher", "DnsClientWatcher\DnsClientWatcher.csproj", "{45094F3A-E4BE-AE1A-D9A3-24E82384DE8F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DnsServerWatcher", "DnsServerWatcher\DnsServerWatcher.csproj", "{E7277258-252F-5CFF-2AC3-41AD7F2FD05B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{45094F3A-E4BE-AE1A-D9A3-24E82384DE8F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{45094F3A-E4BE-AE1A-D9A3-24E82384DE8F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{45094F3A-E4BE-AE1A-D9A3-24E82384DE8F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{45094F3A-E4BE-AE1A-D9A3-24E82384DE8F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E7277258-252F-5CFF-2AC3-41AD7F2FD05B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E7277258-252F-5CFF-2AC3-41AD7F2FD05B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E7277258-252F-5CFF-2AC3-41AD7F2FD05B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E7277258-252F-5CFF-2AC3-41AD7F2FD05B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {45C6DBE1-B9CF-458D-BEBD-37D639031D5A}
+	EndGlobalSection
+EndGlobal

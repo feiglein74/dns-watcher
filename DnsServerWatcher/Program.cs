@@ -1,8 +1,9 @@
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Data.Sqlite;
-using System.Collections.Concurrent;
 using System.Net;
+using DNS.Protocol;
+using DNS.Protocol.ResourceRecords;
 
 namespace DnsServerWatcher;
 
@@ -32,90 +33,58 @@ class Program
     private static SqliteConnection? _sqliteConn = null;
     private static int _retentionDays = 30;
 
-    // DNS Packet Parser - extrahiert IP-Adressen aus der Answer Section
-    private static List<string> ParseDnsAnswers(byte[] packetData, int qtype)
+    // DNS Packet Parser - extrahiert Records aus der Answer Section
+    // Nutzt die DNS Library (https://github.com/kapetan/dns) fuer robustes Parsing
+    private static List<string> ParseDnsAnswers(byte[] packetData)
     {
         var answers = new List<string>();
         if (packetData == null || packetData.Length < 12) return answers;
 
         try
         {
-            // DNS Header: 12 bytes
-            // Bytes 4-5: QDCOUNT (Question Count)
-            // Bytes 6-7: ANCOUNT (Answer Count)
-            int qdcount = (packetData[4] << 8) | packetData[5];
-            int ancount = (packetData[6] << 8) | packetData[7];
+            var response = Response.FromArray(packetData);
 
-            if (ancount == 0) return answers;
-
-            int offset = 12;
-
-            // Skip Question Section
-            for (int i = 0; i < qdcount && offset < packetData.Length; i++)
+            foreach (var record in response.AnswerRecords)
             {
-                offset = SkipDnsName(packetData, offset);
-                offset += 4; // QTYPE (2) + QCLASS (2)
-            }
-
-            // Parse Answer Section
-            for (int i = 0; i < ancount && offset < packetData.Length - 10; i++)
-            {
-                offset = SkipDnsName(packetData, offset);
-
-                if (offset + 10 > packetData.Length) break;
-
-                int atype = (packetData[offset] << 8) | packetData[offset + 1];
-                offset += 2; // TYPE
-                offset += 2; // CLASS
-                offset += 4; // TTL
-                int rdlength = (packetData[offset] << 8) | packetData[offset + 1];
-                offset += 2;
-
-                if (offset + rdlength > packetData.Length) break;
-
-                // A Record (IPv4)
-                if (atype == 1 && rdlength == 4)
+                switch (record)
                 {
-                    var ip = new IPAddress(new ReadOnlySpan<byte>(packetData, offset, 4));
-                    answers.Add(ip.ToString());
+                    case IPAddressResourceRecord ipRecord:
+                        // A und AAAA Records
+                        answers.Add(ipRecord.IPAddress.ToString());
+                        break;
+                    case CanonicalNameResourceRecord cnameRecord:
+                        // CNAME Records
+                        answers.Add($"CNAME:{cnameRecord.CanonicalDomainName}");
+                        break;
+                    case MailExchangeResourceRecord mxRecord:
+                        // MX Records
+                        answers.Add($"MX:{mxRecord.Preference} {mxRecord.ExchangeDomainName}");
+                        break;
+                    case NameServerResourceRecord nsRecord:
+                        // NS Records
+                        answers.Add($"NS:{nsRecord.NSDomainName}");
+                        break;
+                    case PointerResourceRecord ptrRecord:
+                        // PTR Records (Reverse DNS)
+                        answers.Add($"PTR:{ptrRecord.PointerDomainName}");
+                        break;
+                    case TextResourceRecord txtRecord:
+                        // TXT Records
+                        answers.Add($"TXT:{txtRecord.ToStringTextData()}");
+                        break;
+                    default:
+                        // Andere Record-Typen: Zeige Typ und Rohdaten
+                        answers.Add($"{record.Type}:{record}");
+                        break;
                 }
-                // AAAA Record (IPv6)
-                else if (atype == 28 && rdlength == 16)
-                {
-                    var ip = new IPAddress(new ReadOnlySpan<byte>(packetData, offset, 16));
-                    answers.Add(ip.ToString());
-                }
-                // CNAME - skip but continue
-                else if (atype == 5)
-                {
-                    // Could extract CNAME target here if needed
-                }
-
-                offset += rdlength;
             }
         }
-        catch { }
+        catch
+        {
+            // Bei Parse-Fehlern: leere Liste zurueckgeben
+        }
 
         return answers;
-    }
-
-    private static int SkipDnsName(byte[] data, int offset)
-    {
-        while (offset < data.Length)
-        {
-            byte len = data[offset];
-            if (len == 0)
-            {
-                return offset + 1;
-            }
-            // Compression pointer
-            if ((len & 0xC0) == 0xC0)
-            {
-                return offset + 2;
-            }
-            offset += len + 1;
-        }
-        return offset;
     }
 
     // SQLite Datenbank initialisieren
@@ -379,11 +348,11 @@ class Program
             zone = evt.PayloadByName("Zone")?.ToString();
             interfaceIp = evt.PayloadByName("InterfaceIP")?.ToString();
 
-            // PacketData fuer IP-Extraktion
+            // PacketData fuer Record-Extraktion
             packetData = evt.PayloadByName("PacketData") as byte[];
             if (packetData != null && eventId == 257 && (rcode == "OK" || rcode == "0"))
             {
-                resolvedIps = ParseDnsAnswers(packetData, qtypeNum);
+                resolvedIps = ParseDnsAnswers(packetData);
             }
         }
         catch { }
