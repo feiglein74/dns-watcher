@@ -500,6 +500,26 @@ public class DnsClientWatcherService : BackgroundService
         { 11004, "NoData" }
     };
 
+    // Fehler-Kategorien nach Status-Code
+    // CONFIG_ERROR = DNS-Server/Netzwerk-Konfiguration fehlerhaft
+    // CLIENT_ERROR = Client-seitiger Fehler (ungueltige Anfrage, falscher Name)
+    private static readonly HashSet<int> ConfigErrorCodes = new()
+    {
+        9002, // ServFail - DNS-Server Problem
+        9004, // NotImpl - nicht implementiert
+        9005, // Refused - Server verweigert
+        1460, // Timeout - Netzwerk-Problem
+        9560, // Timeout
+        11002, // TryAgain - temporaer nicht erreichbar
+        11003  // NoRecovery - unbekannter Serverfehler
+    };
+
+    private static readonly HashSet<int> ClientErrorCodes = new()
+    {
+        1214, // InvalidName - ungueltiger DNS-Name
+        9702  // RecordFormat - fehlerhafte Antwort
+    };
+
     private readonly ILogger<DnsClientWatcherService> _logger;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly DnsWatcherConfig _config;
@@ -702,22 +722,27 @@ public class DnsClientWatcherService : BackgroundService
                 status TEXT,
                 query_results TEXT,
                 dns_server TEXT,
-                interface_index INTEGER
+                interface_index INTEGER,
+                error_category TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_process_name ON dns_events(process_name);
             CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
             CREATE INDEX IF NOT EXISTS idx_query_results ON dns_events(query_results);
+            CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category);
         ";
 
         using var cmd = new SqliteCommand(createTable, _sqliteConn);
         cmd.ExecuteNonQuery();
 
+        // Schema-Migration: Fehlende Spalten hinzufuegen
+        MigrateSchema();
+
         _insertCmd = new SqliteCommand(@"
             INSERT INTO dns_events
-            (timestamp, event_type, event_id, process_id, process_name, query_name, query_type, status, query_results, dns_server, interface_index)
+            (timestamp, event_type, event_id, process_id, process_name, query_name, query_type, status, query_results, dns_server, interface_index, error_category)
             VALUES
-            (@timestamp, @event_type, @event_id, @process_id, @process_name, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index)
+            (@timestamp, @event_type, @event_id, @process_id, @process_name, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index, @error_category)
         ", _sqliteConn);
         _insertCmd.Parameters.Add("@timestamp", SqliteType.Text);
         _insertCmd.Parameters.Add("@event_type", SqliteType.Text);
@@ -730,6 +755,7 @@ public class DnsClientWatcherService : BackgroundService
         _insertCmd.Parameters.Add("@query_results", SqliteType.Text);
         _insertCmd.Parameters.Add("@dns_server", SqliteType.Text);
         _insertCmd.Parameters.Add("@interface_index", SqliteType.Integer);
+        _insertCmd.Parameters.Add("@error_category", SqliteType.Text);
         _insertCmd.Prepare();
 
         _flushTimer = new Timer(_ => FlushEventQueue(), null, FlushIntervalSec * 1000, FlushIntervalSec * 1000);
@@ -866,6 +892,42 @@ public class DnsClientWatcherService : BackgroundService
         }
     }
 
+    private void MigrateSchema()
+    {
+        if (_sqliteConn == null) return;
+
+        // Pruefen welche Spalten existieren
+        var existingColumns = new HashSet<string>();
+        using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
+        using (var reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+            }
+        }
+
+        // Migration: error_category hinzufuegen (v1.1)
+        if (!existingColumns.Contains("error_category"))
+        {
+            using var alterCmd = new SqliteCommand(
+                "ALTER TABLE dns_events ADD COLUMN error_category TEXT", _sqliteConn);
+            alterCmd.ExecuteNonQuery();
+
+            using var indexCmd = new SqliteCommand(
+                "CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category)", _sqliteConn);
+            indexCmd.ExecuteNonQuery();
+
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("[SQLite] Schema migriert: error_category Spalte hinzugefuegt");
+                Console.ResetColor();
+            }
+            _logger.LogInformation("Schema migriert: error_category Spalte hinzugefuegt");
+        }
+    }
+
     private void QueueEvent(DnsClientEvent evt)
     {
         if (_sqliteConn == null) return;
@@ -908,6 +970,7 @@ public class DnsClientWatcherService : BackgroundService
                 _insertCmd.Parameters["@query_results"].Value = evt.QueryResults ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@dns_server"].Value = evt.DnsServer ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@interface_index"].Value = evt.InterfaceIndex ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@error_category"].Value = evt.ErrorCategory ?? (object)DBNull.Value;
                 _insertCmd.ExecuteNonQuery();
             }
 
@@ -1021,6 +1084,13 @@ public class DnsClientWatcherService : BackgroundService
         }
         catch { }
 
+        // Fehler-Kategorie bestimmen
+        string? errorCategory = null;
+        if (ConfigErrorCodes.Contains(statusNum))
+            errorCategory = "CONFIG_ERROR";
+        else if (ClientErrorCodes.Contains(statusNum))
+            errorCategory = "CLIENT_ERROR";
+
         // JSON Output
         if (_config.JsonOutput)
         {
@@ -1036,7 +1106,8 @@ public class DnsClientWatcherService : BackgroundService
                 status,
                 queryResults = FormatQueryResults(queryResults),
                 dnsServer,
-                interfaceIndex = interfaceIndex > 0 ? interfaceIndex : (int?)null
+                interfaceIndex = interfaceIndex > 0 ? interfaceIndex : (int?)null,
+                errorCategory
             });
             Console.WriteLine(json);
             _logWriter?.WriteLine(json);
@@ -1056,7 +1127,7 @@ public class DnsClientWatcherService : BackgroundService
             var dnsEvent = new DnsClientEvent(
                 evt.TimeStamp, GetEventName(eventId), eventId, processId, processName,
                 queryName, qtype, status, FormatQueryResults(queryResults), dnsServer,
-                interfaceIndex > 0 ? interfaceIndex : null);
+                interfaceIndex > 0 ? interfaceIndex : null, errorCategory);
             QueueEvent(dnsEvent);
             Interlocked.Increment(ref _eventCount);
             CheckPeriodicCleanup();
@@ -1087,7 +1158,9 @@ public class DnsClientWatcherService : BackgroundService
                 break;
 
             case 3008:
-                Console.ForegroundColor = ConsoleColor.Green;
+                var completeColor = statusNum == 0 ? ConsoleColor.Green :
+                    (errorCategory == "CLIENT_ERROR" ? ConsoleColor.DarkYellow : ConsoleColor.Red);
+                Console.ForegroundColor = completeColor;
                 Console.Write("COMPLETE ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.Write(queryName ?? "?");
@@ -1096,6 +1169,11 @@ public class DnsClientWatcherService : BackgroundService
                 Console.Write($"[{qtype ?? "?"}] ");
                 Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
+                if (errorCategory != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write($" ({errorCategory})");
+                }
                 if (!string.IsNullOrEmpty(queryResults))
                 {
                     Console.ForegroundColor = ConsoleColor.Magenta;
@@ -1116,7 +1194,9 @@ public class DnsClientWatcherService : BackgroundService
                 break;
 
             case 3018:
-                Console.ForegroundColor = ConsoleColor.Blue;
+                var cacheColor = statusNum == 0 || statusNum == 87 ? ConsoleColor.Blue :
+                    (errorCategory == "CLIENT_ERROR" ? ConsoleColor.DarkYellow : ConsoleColor.Red);
+                Console.ForegroundColor = cacheColor;
                 Console.Write("CACHE    ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.Write(queryName ?? "?");
@@ -1125,6 +1205,11 @@ public class DnsClientWatcherService : BackgroundService
                 Console.Write($"[{qtype ?? "?"}] ");
                 Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
+                if (errorCategory != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write($" ({errorCategory})");
+                }
                 if (!string.IsNullOrEmpty(queryResults))
                 {
                     Console.ForegroundColor = ConsoleColor.Magenta;
@@ -1134,7 +1219,9 @@ public class DnsClientWatcherService : BackgroundService
                 break;
 
             case 3020:
-                Console.ForegroundColor = ConsoleColor.Green;
+                var respColor = statusNum == 0 ? ConsoleColor.Green :
+                    (errorCategory == "CLIENT_ERROR" ? ConsoleColor.DarkYellow : ConsoleColor.Red);
+                Console.ForegroundColor = respColor;
                 Console.Write("RESPONSE ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.Write(queryName ?? "?");
@@ -1143,6 +1230,11 @@ public class DnsClientWatcherService : BackgroundService
                 Console.Write($"[{qtype ?? "?"}] ");
                 Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
+                if (errorCategory != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write($" ({errorCategory})");
+                }
                 if (!string.IsNullOrEmpty(queryResults))
                 {
                     Console.ForegroundColor = ConsoleColor.Magenta;
@@ -1184,5 +1276,6 @@ public record DnsClientEvent(
     string? Status,
     string? QueryResults,
     string? DnsServer,
-    int? InterfaceIndex
+    int? InterfaceIndex,
+    string? ErrorCategory = null
 );

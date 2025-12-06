@@ -452,7 +452,20 @@ public class DnsServerWatcherService : BackgroundService
     private static readonly Dictionary<int, string> ResponseCodes = new()
     {
         { 0, "OK" }, { 1, "FormErr" }, { 2, "ServFail" },
-        { 3, "NXDomain" }, { 4, "NotImpl" }, { 5, "Refused" }
+        { 3, "NXDomain" }, { 4, "NotImpl" }, { 5, "Refused" },
+        { 6, "YXDomain" }, { 7, "YXRRSet" }, { 8, "NXRRSet" },
+        { 9, "NotAuth" }, { 10, "NotZone" }
+    };
+
+    // Fehler-Kategorien
+    private static readonly HashSet<string> ConfigErrors = new()
+    {
+        "NXDomain", "ServFail", "Refused", "NotImpl", "NotAuth", "NotZone"
+    };
+
+    private static readonly HashSet<string> ClientErrors = new()
+    {
+        "FormErr", "YXDomain", "YXRRSet", "NXRRSet"
     };
 
     private readonly ILogger<DnsServerWatcherService> _logger;
@@ -635,22 +648,27 @@ public class DnsServerWatcherService : BackgroundService
                 query_type TEXT,
                 response_code TEXT,
                 resolved_ips TEXT,
-                zone TEXT
+                zone TEXT,
+                error_category TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_client_ip ON dns_events(client_ip);
             CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
             CREATE INDEX IF NOT EXISTS idx_resolved_ips ON dns_events(resolved_ips);
+            CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category);
         ";
 
         using var cmd = new SqliteCommand(createTable, _sqliteConn);
         cmd.ExecuteNonQuery();
 
+        // Schema-Migration: Fehlende Spalten hinzufuegen
+        MigrateSchema();
+
         _insertCmd = new SqliteCommand(@"
             INSERT INTO dns_events
-            (timestamp, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone)
+            (timestamp, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone, error_category)
             VALUES
-            (@timestamp, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone)
+            (@timestamp, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone, @error_category)
         ", _sqliteConn);
         _insertCmd.Parameters.Add("@timestamp", SqliteType.Text);
         _insertCmd.Parameters.Add("@event_type", SqliteType.Text);
@@ -660,6 +678,7 @@ public class DnsServerWatcherService : BackgroundService
         _insertCmd.Parameters.Add("@response_code", SqliteType.Text);
         _insertCmd.Parameters.Add("@resolved_ips", SqliteType.Text);
         _insertCmd.Parameters.Add("@zone", SqliteType.Text);
+        _insertCmd.Parameters.Add("@error_category", SqliteType.Text);
         _insertCmd.Prepare();
 
         _flushTimer = new Timer(_ => FlushEventQueue(), null, FlushIntervalSec * 1000, FlushIntervalSec * 1000);
@@ -796,6 +815,42 @@ public class DnsServerWatcherService : BackgroundService
         }
     }
 
+    private void MigrateSchema()
+    {
+        if (_sqliteConn == null) return;
+
+        // Pruefen welche Spalten existieren
+        var existingColumns = new HashSet<string>();
+        using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
+        using (var reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+            }
+        }
+
+        // Migration: error_category hinzufuegen (v1.1)
+        if (!existingColumns.Contains("error_category"))
+        {
+            using var alterCmd = new SqliteCommand(
+                "ALTER TABLE dns_events ADD COLUMN error_category TEXT", _sqliteConn);
+            alterCmd.ExecuteNonQuery();
+
+            using var indexCmd = new SqliteCommand(
+                "CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category)", _sqliteConn);
+            indexCmd.ExecuteNonQuery();
+
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("[SQLite] Schema migriert: error_category Spalte hinzugefuegt");
+                Console.ResetColor();
+            }
+            _logger.LogInformation("Schema migriert: error_category Spalte hinzugefuegt");
+        }
+    }
+
     private void QueueEvent(DnsServerEvent evt)
     {
         if (_sqliteConn == null) return;
@@ -835,6 +890,7 @@ public class DnsServerWatcherService : BackgroundService
                 _insertCmd.Parameters["@response_code"].Value = evt.ResponseCode ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@resolved_ips"].Value = evt.ResolvedIps ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@zone"].Value = evt.Zone ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@error_category"].Value = evt.ErrorCategory ?? (object)DBNull.Value;
                 _insertCmd.ExecuteNonQuery();
             }
 
@@ -848,10 +904,11 @@ public class DnsServerWatcherService : BackgroundService
         }
     }
 
-    private static List<string> ParseDnsAnswers(byte[] packetData)
+    private static (List<string> answers, string? parseError) ParseDnsAnswers(byte[] packetData)
     {
         var answers = new List<string>();
-        if (packetData == null || packetData.Length < 12) return answers;
+        if (packetData == null || packetData.Length < 12)
+            return (answers, packetData == null ? null : "TRUNCATED");
 
         try
         {
@@ -897,9 +954,12 @@ public class DnsServerWatcherService : BackgroundService
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            return (answers, $"MALFORMED:{ex.Message}");
+        }
 
-        return answers;
+        return (answers, null);
     }
 
     private static string GetEventName(int eventId) => eventId switch
@@ -922,6 +982,7 @@ public class DnsServerWatcherService : BackgroundService
         var eventId = (int)evt.ID;
 
         string? qname = null, source = null, dest = null, qtype = null, rcode = null, zone = null;
+        string? parseError = null;
         byte[]? packetData = null;
         List<string> resolvedIps = new();
 
@@ -942,10 +1003,23 @@ public class DnsServerWatcherService : BackgroundService
             zone = evt.PayloadByName("Zone")?.ToString();
 
             packetData = evt.PayloadByName("PacketData") as byte[];
-            if (packetData != null && eventId == 257 && (rcode == "OK" || rcode == "0"))
-                resolvedIps = ParseDnsAnswers(packetData);
+            if (packetData != null && (eventId == 257 || eventId == 261))
+            {
+                var (answers, error) = ParseDnsAnswers(packetData);
+                resolvedIps = answers;
+                parseError = error;
+            }
         }
         catch { }
+
+        // Fehler-Kategorie bestimmen
+        string? errorCategory = null;
+        if (parseError != null)
+            errorCategory = "CLIENT_ERROR";
+        else if (rcode != null && ClientErrors.Contains(rcode))
+            errorCategory = "CLIENT_ERROR";
+        else if (rcode != null && ConfigErrors.Contains(rcode))
+            errorCategory = "CONFIG_ERROR";
 
         // JSON Output
         if (_config.JsonOutput)
@@ -961,7 +1035,9 @@ public class DnsServerWatcherService : BackgroundService
                 queryType = qtype,
                 responseCode = rcode,
                 resolvedAddresses = resolvedIps.Count > 0 ? resolvedIps : null,
-                zone
+                zone,
+                parseError,
+                errorCategory
             });
             Console.WriteLine(json);
             _logWriter?.WriteLine(json);
@@ -980,14 +1056,22 @@ public class DnsServerWatcherService : BackgroundService
             _logWriter.WriteLine(line);
         }
 
-        // SQLite speichern
-        if (_sqliteConn != null && (eventId == 256 || eventId == 257))
+        // SQLite speichern (auch Fehler-Events 260, 261)
+        if (_sqliteConn != null && (eventId == 256 || eventId == 257 || eventId == 260 || eventId == 261))
         {
-            var eventType = eventId == 256 ? "QUERY" : "RESPONSE";
+            var eventType = eventId switch
+            {
+                256 => "QUERY",
+                257 => "RESPONSE",
+                260 => "TIMEOUT",
+                261 => "FAILURE",
+                _ => $"EVENT_{eventId}"
+            };
             var clientIp = eventId == 256 ? source : dest;
+            var resolvedInfo = parseError ?? (resolvedIps.Count > 0 ? string.Join(",", resolvedIps) : null);
             var dnsEvent = new DnsServerEvent(
                 evt.TimeStamp, eventType, clientIp, qname, qtype, rcode,
-                resolvedIps.Count > 0 ? string.Join(",", resolvedIps) : null, zone);
+                resolvedInfo, zone, errorCategory);
             QueueEvent(dnsEvent);
             Interlocked.Increment(ref _eventCount);
             CheckPeriodicCleanup();
@@ -996,7 +1080,7 @@ public class DnsServerWatcherService : BackgroundService
         // Console-Ausgabe
         if (_config.Quiet || !Environment.UserInteractive) return;
         if (eventId == 280 && !_config.ShowRaw) return;
-        if (eventId != 256 && eventId != 257 && eventId != 280) return;
+        if (eventId != 256 && eventId != 257 && eventId != 260 && eventId != 261 && eventId != 280) return;
 
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.Write($"[{timestamp}] ");
@@ -1018,7 +1102,10 @@ public class DnsServerWatcherService : BackgroundService
                 break;
 
             case 257:
-                Console.ForegroundColor = ConsoleColor.Green;
+                // Response-Farbe je nach Kategorie
+                var respColor = rcode == "OK" ? ConsoleColor.Green :
+                    (errorCategory == "CLIENT_ERROR" ? ConsoleColor.DarkYellow : ConsoleColor.Red);
+                Console.ForegroundColor = respColor;
                 Console.Write("RESPONSE ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.Write(dest ?? "?");
@@ -1029,12 +1116,58 @@ public class DnsServerWatcherService : BackgroundService
                 Console.Write(" ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.Write($"[{qtype ?? "?"}] ");
-                Console.ForegroundColor = rcode == "OK" ? ConsoleColor.Green : ConsoleColor.Red;
+                Console.ForegroundColor = respColor;
                 Console.Write(rcode ?? "?");
+                if (errorCategory != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write($" ({errorCategory})");
+                }
+                if (parseError != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Write($" [{parseError}]");
+                }
                 if (resolvedIps.Count > 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Magenta;
                     Console.Write(" => " + string.Join(", ", resolvedIps));
+                }
+                Console.WriteLine();
+                break;
+
+            case 260:
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Write("TIMEOUT  ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(source ?? dest ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" -- ");
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write(qname ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"[{qtype ?? "?"}]");
+                break;
+
+            case 261:
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Write("FAILURE  ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(dest ?? source ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" <- ");
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write(qname ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write($"[{qtype ?? "?"}] ");
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Write(rcode ?? "?");
+                if (parseError != null)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkRed;
+                    Console.Write($" [{parseError}]");
                 }
                 Console.WriteLine();
                 break;
@@ -1067,5 +1200,6 @@ public record DnsServerEvent(
     string? QueryType,
     string? ResponseCode,
     string? ResolvedIps,
-    string? Zone
+    string? Zone,
+    string? ErrorCategory = null
 );
