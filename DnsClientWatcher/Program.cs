@@ -17,17 +17,41 @@ class Program
         { 33, "SRV" }, { 255, "ANY" }, { 65, "HTTPS" }
     };
 
-    // DNS Client Status Codes
+    // DNS Client Status Codes (Windows System Error Codes + DNS-spezifische)
+    // Siehe: https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes
     private static readonly Dictionary<int, string> StatusCodes = new()
     {
         { 0, "OK" },
-        { 9003, "NXDomain" },
-        { 9501, "NoRecords" },
-        { 9560, "Timeout" },
-        { 1460, "Timeout" },
-        { 87, "InvalidParam" },
-        { 1214, "InvalidName" }
+        { 87, "Cached" },           // ERROR_INVALID_PARAMETER - aus Cache/hosts, kein Netzwerk-Query
+        { 1168, "NotFound" },       // ERROR_NOT_FOUND
+        { 1214, "InvalidName" },    // ERROR_INVALID_NETNAME
+        { 1460, "Timeout" },        // ERROR_TIMEOUT
+        { 9002, "ServFail" },       // DNS_ERROR_RCODE_SERVER_FAILURE
+        { 9003, "NXDomain" },       // DNS_ERROR_RCODE_NAME_ERROR - Domain existiert nicht
+        { 9004, "NotImpl" },        // DNS_ERROR_RCODE_NOT_IMPLEMENTED
+        { 9005, "Refused" },        // DNS_ERROR_RCODE_REFUSED
+        { 9501, "NoRecords" },      // DNS_INFO_NO_RECORDS
+        { 9560, "Timeout" },        // DNS_ERROR_RCODE_TIMEOUT
+        { 9701, "NoRecord" },       // DNS_ERROR_RECORD_DOES_NOT_EXIST - Record-Typ existiert nicht (z.B. kein AAAA)
+        { 9702, "RecordFormat" },   // DNS_ERROR_RECORD_FORMAT
+        { 11001, "HostNotFound" },  // WSAHOST_NOT_FOUND
+        { 11002, "TryAgain" },      // WSATRY_AGAIN
+        { 11003, "NoRecovery" },    // WSANO_RECOVERY
+        { 11004, "NoData" }         // WSANO_DATA
     };
+
+    // Bestimmt die Farbe basierend auf Status-Code
+    private static ConsoleColor GetStatusColor(int statusNum)
+    {
+        return statusNum switch
+        {
+            0 => ConsoleColor.Green,         // OK
+            87 => ConsoleColor.DarkGray,     // Cached - aus Cache/hosts (kein Netzwerk-Query)
+            9701 => ConsoleColor.DarkYellow, // NoRecord - Record-Typ existiert nicht (z.B. kein AAAA)
+            9501 => ConsoleColor.DarkYellow, // NoRecords - keine Records
+            _ => ConsoleColor.Red            // Alle anderen sind Fehler
+        };
+    }
 
     private static bool _showRaw = false;
     private static bool _jsonOutput = false;
@@ -354,7 +378,7 @@ class Program
                 Console.Write(" ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.Write($"[{qtype ?? "?"}] ");
-                Console.ForegroundColor = statusNum == 0 ? ConsoleColor.Green : ConsoleColor.Red;
+                Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
                 if (!string.IsNullOrEmpty(queryResults))
                 {
@@ -383,7 +407,7 @@ class Program
                 Console.Write(" ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.Write($"[{qtype ?? "?"}] ");
-                Console.ForegroundColor = statusNum == 0 ? ConsoleColor.Green : ConsoleColor.Red;
+                Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
                 if (!string.IsNullOrEmpty(queryResults))
                 {
@@ -401,7 +425,7 @@ class Program
                 Console.Write(" ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.Write($"[{qtype ?? "?"}] ");
-                Console.ForegroundColor = statusNum == 0 ? ConsoleColor.Green : ConsoleColor.Red;
+                Console.ForegroundColor = GetStatusColor(statusNum);
                 Console.Write(status ?? "?");
                 if (!string.IsNullOrEmpty(queryResults))
                 {
