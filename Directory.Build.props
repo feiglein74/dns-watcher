@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <!-- Code-Analyse aktivieren -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!-- Warnungen als Fehler fuer wichtige Kategorien -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+
+    <!-- Windows-spezifische APIs erlauben (da nur Windows unterstuetzt) -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+</Project>

@@ -1,14 +1,437 @@
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Data.Sqlite;
-using System.Net;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.EventLog;
+using System.Diagnostics;
 using ARSoft.Tools.Net.Dns;
 
 namespace DnsServerWatcher;
 
 class Program
 {
-    // Microsoft-Windows-DNSServer Provider GUID
+    private const string ServiceName = "DnsServerWatcher";
+    private const string ServiceDisplayName = "DNS Server ETW Watcher";
+    private const string ServiceDescription = "Protokolliert DNS-Anfragen und -Antworten in Echtzeit via ETW. Speichert Events in SQLite fuer spaetere Analyse (z.B. IP-Adressen zu DNS-Namen zuordnen).";
+    private const string EventLogSource = "DnsServerWatcher";
+
+    static void Main(string[] args)
+    {
+        // Service-Kommandos zuerst pruefen
+        if (args.Length > 0)
+        {
+            var cmd = args[0].ToLowerInvariant();
+            if (cmd == "install" || cmd == "--install")
+            {
+                InstallService(args.Skip(1).ToArray());
+                return;
+            }
+            if (cmd == "uninstall" || cmd == "--uninstall")
+            {
+                UninstallService();
+                return;
+            }
+            if (cmd == "start" || cmd == "--start")
+            {
+                StartService();
+                return;
+            }
+            if (cmd == "stop" || cmd == "--stop")
+            {
+                StopService();
+                return;
+            }
+            if (cmd == "status" || cmd == "--status")
+            {
+                ShowServiceStatus();
+                return;
+            }
+        }
+
+        if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
+        {
+            PrintHelp();
+            return;
+        }
+
+        // Admin-Check
+        if (!TraceEventSession.IsElevated() ?? false)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("FEHLER: Muss als Administrator ausgefuehrt werden!");
+            Console.ResetColor();
+            return;
+        }
+
+        // Konfiguration aus Args parsen
+        var config = DnsWatcherConfig.FromArgs(args);
+
+        // Host erstellen - automatische Erkennung ob Service oder Console
+        var builder = Host.CreateApplicationBuilder(args);
+        builder.Services.AddSingleton(config);
+        builder.Services.AddHostedService<DnsServerWatcherService>();
+        builder.Services.AddWindowsService(options => options.ServiceName = ServiceName);
+        builder.Logging.AddEventLog(new EventLogSettings
+        {
+            SourceName = EventLogSource,
+            LogName = "Application"
+        });
+
+        var host = builder.Build();
+        host.Run();
+    }
+
+    private static void InstallService(string[] serviceArgs)
+    {
+        var exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+        if (exePath == null)
+        {
+            Console.WriteLine("Fehler: Konnte Programmpfad nicht ermitteln");
+            return;
+        }
+
+        var args = serviceArgs.Length > 0 ? string.Join(" ", serviceArgs) : "";
+
+        try
+        {
+            if (!EventLog.SourceExists(EventLogSource))
+            {
+                EventLog.CreateEventSource(EventLogSource, "Application");
+                Console.WriteLine($"[OK] EventLog Source '{EventLogSource}' erstellt");
+            }
+
+            var binPath = string.IsNullOrEmpty(args) ? $"\"{exePath}\"" : $"\"{exePath}\" {args}";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"create {ServiceName} binPath= \"{binPath}\" start= auto DisplayName= \"{ServiceDisplayName}\"",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit();
+
+            if (proc?.ExitCode == 0)
+            {
+                // Description setzen
+                var descPsi = new ProcessStartInfo
+                {
+                    FileName = "sc.exe",
+                    Arguments = $"description {ServiceName} \"{ServiceDescription}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using var descProc = Process.Start(descPsi);
+                descProc?.WaitForExit();
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[OK] Service '{ServiceName}' installiert");
+                Console.WriteLine($"     Pfad: {binPath}");
+                Console.ResetColor();
+                Console.WriteLine();
+                Console.WriteLine("Starten mit: DnsServerWatcher.exe start");
+            }
+            else
+            {
+                var error = proc?.StandardError.ReadToEnd();
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[FEHLER] {error}");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[FEHLER] {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void UninstallService()
+    {
+        try
+        {
+            StopService();
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"delete {ServiceName}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit();
+
+            if (proc?.ExitCode == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[OK] Service '{ServiceName}' deinstalliert");
+                Console.ResetColor();
+            }
+
+            if (EventLog.SourceExists(EventLogSource))
+            {
+                EventLog.DeleteEventSource(EventLogSource);
+                Console.WriteLine($"[OK] EventLog Source '{EventLogSource}' entfernt");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[FEHLER] {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void StartService()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"start {ServiceName}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit();
+
+            if (proc?.ExitCode == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[OK] Service '{ServiceName}' gestartet");
+                Console.ResetColor();
+            }
+            else
+            {
+                var error = proc?.StandardError.ReadToEnd();
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[FEHLER] {error?.Trim()}");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[FEHLER] {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void StopService()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"stop {ServiceName}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit();
+
+            if (proc?.ExitCode == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[OK] Service '{ServiceName}' gestoppt");
+                Console.ResetColor();
+            }
+        }
+        catch { }
+    }
+
+    private static void ShowServiceStatus()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = $"query {ServiceName}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            var output = proc?.StandardOutput.ReadToEnd();
+            proc?.WaitForExit();
+
+            if (proc?.ExitCode == 0 && output != null)
+            {
+                Console.WriteLine($"Service: {ServiceName}");
+                Console.WriteLine(new string('-', 40));
+
+                if (output.Contains("RUNNING"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("Status: RUNNING");
+                }
+                else if (output.Contains("STOPPED"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("Status: STOPPED");
+                }
+                else
+                {
+                    Console.WriteLine(output);
+                }
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Service '{ServiceName}' ist nicht installiert");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[FEHLER] {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine(@"
+DNS Server Real-Time ETW Watcher
+================================
+
+Zeigt DNS Server Events in Echtzeit an.
+Muss als Administrator ausgefuehrt werden.
+
+Verwendung:
+  DnsServerWatcher.exe [optionen]
+  DnsServerWatcher.exe [service-kommando] [optionen]
+
+Service-Kommandos:
+  install [opts]     Installiert als Windows-Dienst mit den angegebenen Optionen
+  uninstall          Deinstalliert den Windows-Dienst
+  start              Startet den Windows-Dienst
+  stop               Stoppt den Windows-Dienst
+  status             Zeigt den Status des Windows-Dienstes
+
+Optionen:
+  -r, --raw          Zeige alle Event-Properties
+  -j, --json         Ausgabe als JSON (eine Zeile pro Event)
+  -q, --quiet        Keine Console-Ausgabe (nur SQLite/Log schreiben)
+  -l, --log=X        Schreibe Events zusaetzlich in Datei X
+  -s, --sqlite=X     Speichere Events in SQLite Datenbank X
+      --retention=N  Behalte Eintraege fuer N Tage (default: 30)
+      --max-size=X   Max. Datenbankgroesse (z.B. 500MB, 1GB)
+      --backups=N    Anzahl Backup-Versionen (default: 3, 0=keine)
+  -h, --help, /?     Diese Hilfe anzeigen
+
+SQLite Wartung:
+  - Retention-Cleanup: Beim Start + taeglich waehrend Laufzeit
+  - Size-Cleanup: Loescht aelteste 10% wenn max-size ueberschritten
+  - VACUUM: Automatisch nach groesseren Loeschungen (>1000 Eintraege)
+  - Backup: Vor jedem Cleanup, rotiert (backup1, backup2, backup3...)
+
+Beispiele (Konsole):
+  DnsServerWatcher.exe
+  DnsServerWatcher.exe --sqlite=C:\Logs\dns.db --retention=30 --max-size=500MB
+
+Beispiele (Service):
+  DnsServerWatcher.exe install --sqlite=C:\Logs\dns.db --retention=30
+  DnsServerWatcher.exe start
+  DnsServerWatcher.exe status
+  DnsServerWatcher.exe stop
+  DnsServerWatcher.exe uninstall
+
+EventLog:
+  Im Service-Modus werden Meldungen ins Windows EventLog geschrieben:
+  - Quelle: DnsServerWatcher
+  - Log: Application
+  - Statistik alle 5 Minuten
+
+SQLite-Abfragen:
+  SELECT * FROM dns_events WHERE resolved_ips LIKE '%142.250.185%';
+  SELECT * FROM dns_events WHERE client_ip = '10.0.0.51';
+  SELECT * FROM dns_events WHERE query_name LIKE '%google%';
+");
+    }
+}
+
+// Konfiguration
+public class DnsWatcherConfig
+{
+    public bool ShowRaw { get; set; }
+    public bool JsonOutput { get; set; }
+    public bool Quiet { get; set; }
+    public string? LogFile { get; set; }
+    public string? SqliteDb { get; set; }
+    public int RetentionDays { get; set; } = 30;
+    public long MaxSizeBytes { get; set; }
+    public int BackupCount { get; set; } = 3;
+
+    public static DnsWatcherConfig FromArgs(string[] args)
+    {
+        var config = new DnsWatcherConfig
+        {
+            ShowRaw = args.Contains("--raw") || args.Contains("-r"),
+            JsonOutput = args.Contains("--json") || args.Contains("-j"),
+            Quiet = args.Contains("--quiet") || args.Contains("-q")
+        };
+
+        var logArg = args.FirstOrDefault(a => a.StartsWith("--log=") || a.StartsWith("-l="));
+        if (logArg != null)
+            config.LogFile = logArg.Split('=')[1];
+
+        var sqliteArg = args.FirstOrDefault(a => a.StartsWith("--sqlite=") || a.StartsWith("-s="));
+        if (sqliteArg != null)
+            config.SqliteDb = sqliteArg.Split('=')[1];
+
+        var retentionArg = args.FirstOrDefault(a => a.StartsWith("--retention="));
+        if (retentionArg != null && int.TryParse(retentionArg.Split('=')[1], out int days))
+            config.RetentionDays = days;
+
+        var maxSizeArg = args.FirstOrDefault(a => a.StartsWith("--max-size="));
+        if (maxSizeArg != null)
+        {
+            var sizeStr = maxSizeArg.Split('=')[1].ToUpperInvariant();
+            if (sizeStr.EndsWith("GB") && long.TryParse(sizeStr.Replace("GB", ""), out long gb))
+                config.MaxSizeBytes = gb * 1024 * 1024 * 1024;
+            else if (sizeStr.EndsWith("MB") && long.TryParse(sizeStr.Replace("MB", ""), out long mb))
+                config.MaxSizeBytes = mb * 1024 * 1024;
+            else if (long.TryParse(sizeStr, out long mb2))
+                config.MaxSizeBytes = mb2 * 1024 * 1024;
+        }
+
+        var backupsArg = args.FirstOrDefault(a => a.StartsWith("--backups="));
+        if (backupsArg != null && int.TryParse(backupsArg.Split('=')[1], out int backups))
+            config.BackupCount = Math.Max(0, backups);
+
+        return config;
+    }
+}
+
+// Der eigentliche Watcher als BackgroundService
+public class DnsServerWatcherService : BackgroundService
+{
     private static readonly Guid DnsServerProviderGuid = new("EB79061A-A566-4698-9119-3ED2807060E7");
 
     private static readonly Dictionary<int, string> QueryTypes = new()
@@ -24,18 +447,399 @@ class Program
         { 3, "NXDomain" }, { 4, "NotImpl" }, { 5, "Refused" }
     };
 
-    private static bool _showRaw = false;
-    private static bool _jsonOutput = false;
-    private static bool _quiet = false;
-    private static string? _logFile = null;
-    private static StreamWriter? _logWriter = null;
-    private static string? _sqliteDb = null;
-    private static SqliteConnection? _sqliteConn = null;
-    private static int _retentionDays = 30;
+    private readonly ILogger<DnsServerWatcherService> _logger;
+    private readonly DnsWatcherConfig _config;
+    private readonly List<DnsServerEvent> _eventQueue = new();
+    private readonly object _queueLock = new();
 
-    // DNS Packet Parser - extrahiert Records aus der Answer Section
-    // Nutzt ARSoft.Tools.Net (https://github.com/alexreinert/ARSoft.Tools.Net)
-    // Implementiert 60+ RFCs inkl. DNSSEC, EDNS, DANE
+    private TraceEventSession? _session;
+    private SqliteConnection? _sqliteConn;
+    private SqliteCommand? _insertCmd;
+    private StreamWriter? _logWriter;
+    private Timer? _flushTimer;
+    private Timer? _statsTimer;
+    private DateTime _startTime;
+    private DateTime _lastCleanup = DateTime.MinValue;
+    private long _eventCount;
+
+    private const int BatchSize = 100;
+    private const int FlushIntervalSec = 5;
+    private const int CleanupIntervalDays = 1;
+
+    public DnsServerWatcherService(ILogger<DnsServerWatcherService> logger, DnsWatcherConfig config)
+    {
+        _logger = logger;
+        _config = config;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _startTime = DateTime.Now;
+        var isConsole = Environment.UserInteractive;
+
+        if (isConsole && !_config.Quiet)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine();
+            Console.WriteLine("========================================");
+            Console.WriteLine("  DNS Server Real-Time ETW Watcher");
+            Console.WriteLine("========================================");
+            Console.ResetColor();
+            Console.WriteLine();
+        }
+
+        // SQLite initialisieren
+        if (_config.SqliteDb != null)
+        {
+            try
+            {
+                InitSqlite(_config.SqliteDb);
+                _logger.LogInformation("SQLite Datenbank initialisiert: {Path} (Retention: {Days} Tage)",
+                    _config.SqliteDb, _config.RetentionDays);
+
+                if (isConsole && !_config.Quiet)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"[OK] SQLite Datenbank: {_config.SqliteDb}");
+                    Console.WriteLine($"     Retention: {_config.RetentionDays} Tage");
+                    if (_config.MaxSizeBytes > 0)
+                        Console.WriteLine($"     Max-Size: {_config.MaxSizeBytes / 1024 / 1024} MB");
+                    Console.WriteLine($"     Backups: {_config.BackupCount}");
+                    Console.ResetColor();
+                }
+                CleanupBySize();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SQLite Fehler");
+                if (isConsole)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[FEHLER] SQLite: {ex.Message}");
+                    Console.ResetColor();
+                }
+                return;
+            }
+        }
+
+        if (_config.LogFile != null)
+            _logWriter = new StreamWriter(_config.LogFile, append: true) { AutoFlush = true };
+
+        var sessionName = $"DnsServerWatcher_{Environment.ProcessId}";
+
+        try
+        {
+            using var oldSession = TraceEventSession.GetActiveSession(sessionName);
+            oldSession?.Stop();
+        }
+        catch { }
+
+        if (isConsole && !_config.Quiet)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"Starte ETW Session: {sessionName}");
+            Console.ResetColor();
+        }
+
+        _session = new TraceEventSession(sessionName);
+        _session.Source.Dynamic.All += ProcessEvent;
+        _session.EnableProvider(DnsServerProviderGuid, TraceEventLevel.Verbose, ulong.MaxValue);
+
+        _statsTimer = new Timer(_ => WriteStats(), null, 5 * 60 * 1000, 5 * 60 * 1000);
+
+        _logger.LogInformation("DnsServerWatcher gestartet");
+
+        if (isConsole && !_config.Quiet)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("[OK] DNS Server Provider aktiviert");
+            Console.WriteLine();
+            Console.WriteLine("==========================================");
+            Console.WriteLine("  LIVE - Warte auf DNS Events (Ctrl+C)");
+            Console.WriteLine("==========================================");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            if (!_config.JsonOutput)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("Legende: QUERY=Anfrage empfangen, RESPONSE=Antwort gesendet");
+                Console.WriteLine();
+                Console.ResetColor();
+            }
+        }
+
+        var processingTask = Task.Run(() => _session.Source.Process(), stoppingToken);
+
+        try
+        {
+            await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+        catch (OperationCanceledException) { }
+
+        _session.Stop();
+        await processingTask;
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("DnsServerWatcher wird beendet. {Count:N0} Events verarbeitet.", _eventCount);
+
+        _session?.Stop();
+        _statsTimer?.Dispose();
+        _flushTimer?.Dispose();
+
+        FlushEventQueue();
+
+        _insertCmd?.Dispose();
+        _sqliteConn?.Close();
+        _logWriter?.Close();
+
+        if (Environment.UserInteractive && !_config.Quiet)
+            Console.WriteLine("Fertig.");
+
+        await base.StopAsync(cancellationToken);
+    }
+
+    private void WriteStats()
+    {
+        var runtime = DateTime.Now - _startTime;
+        var eventsPerSec = _eventCount / Math.Max(1, runtime.TotalSeconds);
+        _logger.LogInformation("Laeuft seit {Runtime:hh\\:mm\\:ss}, {Count:N0} Events ({Rate:F1}/s)",
+            runtime, _eventCount, eventsPerSec);
+    }
+
+    private void InitSqlite(string dbPath)
+    {
+        _sqliteConn = new SqliteConnection($"Data Source={dbPath}");
+        _sqliteConn.Open();
+
+        using (var walCmd = new SqliteCommand("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", _sqliteConn))
+            walCmd.ExecuteNonQuery();
+
+        var createTable = @"
+            CREATE TABLE IF NOT EXISTS dns_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                client_ip TEXT,
+                query_name TEXT,
+                query_type TEXT,
+                response_code TEXT,
+                resolved_ips TEXT,
+                zone TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_client_ip ON dns_events(client_ip);
+            CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
+            CREATE INDEX IF NOT EXISTS idx_resolved_ips ON dns_events(resolved_ips);
+        ";
+
+        using var cmd = new SqliteCommand(createTable, _sqliteConn);
+        cmd.ExecuteNonQuery();
+
+        _insertCmd = new SqliteCommand(@"
+            INSERT INTO dns_events
+            (timestamp, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone)
+            VALUES
+            (@timestamp, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone)
+        ", _sqliteConn);
+        _insertCmd.Parameters.Add("@timestamp", SqliteType.Text);
+        _insertCmd.Parameters.Add("@event_type", SqliteType.Text);
+        _insertCmd.Parameters.Add("@client_ip", SqliteType.Text);
+        _insertCmd.Parameters.Add("@query_name", SqliteType.Text);
+        _insertCmd.Parameters.Add("@query_type", SqliteType.Text);
+        _insertCmd.Parameters.Add("@response_code", SqliteType.Text);
+        _insertCmd.Parameters.Add("@resolved_ips", SqliteType.Text);
+        _insertCmd.Parameters.Add("@zone", SqliteType.Text);
+        _insertCmd.Prepare();
+
+        _flushTimer = new Timer(_ => FlushEventQueue(), null, FlushIntervalSec * 1000, FlushIntervalSec * 1000);
+
+        CreateBackup();
+        CleanupOldEntries();
+    }
+
+    private void CreateBackup()
+    {
+        if (_config.SqliteDb == null || !File.Exists(_config.SqliteDb) || _config.BackupCount <= 0) return;
+
+        var fileInfo = new FileInfo(_config.SqliteDb);
+        var directory = fileInfo.DirectoryName ?? ".";
+        var baseName = Path.GetFileNameWithoutExtension(_config.SqliteDb);
+        var extension = Path.GetExtension(_config.SqliteDb);
+
+        for (int i = _config.BackupCount; i >= 1; i--)
+        {
+            var oldBackup = Path.Combine(directory, $"{baseName}.backup{i}{extension}");
+            var newBackup = Path.Combine(directory, $"{baseName}.backup{i + 1}{extension}");
+
+            if (File.Exists(oldBackup))
+            {
+                if (i == _config.BackupCount)
+                    File.Delete(oldBackup);
+                else
+                {
+                    if (File.Exists(newBackup)) File.Delete(newBackup);
+                    File.Move(oldBackup, newBackup);
+                }
+            }
+        }
+
+        var backupPath = Path.Combine(directory, $"{baseName}.backup1{extension}");
+        try
+        {
+            File.Copy(_config.SqliteDb, backupPath, overwrite: true);
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"[SQLite] Backup erstellt: {Path.GetFileName(backupPath)}");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Backup fehlgeschlagen: {Message}", ex.Message);
+        }
+    }
+
+    private void CleanupOldEntries()
+    {
+        if (_sqliteConn == null) return;
+
+        var cutoff = DateTime.Now.AddDays(-_config.RetentionDays).ToString("o");
+        using var cmd = new SqliteCommand("DELETE FROM dns_events WHERE timestamp < @cutoff", _sqliteConn);
+        cmd.Parameters.AddWithValue("@cutoff", cutoff);
+        var deleted = cmd.ExecuteNonQuery();
+
+        if (deleted > 0)
+        {
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"[SQLite] {deleted} Eintraege aelter als {_config.RetentionDays} Tage geloescht");
+                Console.ResetColor();
+            }
+            RunVacuumIfNeeded(deleted);
+        }
+
+        _lastCleanup = DateTime.Now;
+    }
+
+    private void CleanupBySize()
+    {
+        if (_sqliteConn == null || _config.MaxSizeBytes <= 0 || _config.SqliteDb == null) return;
+
+        var fileInfo = new FileInfo(_config.SqliteDb);
+        if (!fileInfo.Exists || fileInfo.Length <= _config.MaxSizeBytes) return;
+
+        var countCmd = new SqliteCommand("SELECT COUNT(*) FROM dns_events", _sqliteConn);
+        var totalCount = Convert.ToInt64(countCmd.ExecuteScalar());
+        var deleteCount = Math.Max(1, totalCount / 10);
+
+        using var cmd = new SqliteCommand(@"
+            DELETE FROM dns_events WHERE id IN (
+                SELECT id FROM dns_events ORDER BY timestamp ASC LIMIT @count
+            )", _sqliteConn);
+        cmd.Parameters.AddWithValue("@count", deleteCount);
+        var deleted = cmd.ExecuteNonQuery();
+
+        if (deleted > 0)
+        {
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"[SQLite] {deleted} aelteste Eintraege geloescht (max-size erreicht)");
+                Console.ResetColor();
+            }
+            RunVacuumIfNeeded(deleted);
+        }
+    }
+
+    private void RunVacuumIfNeeded(int deletedCount)
+    {
+        if (_sqliteConn == null || deletedCount < 1000) return;
+
+        try
+        {
+            using var vacuumCmd = new SqliteCommand("VACUUM", _sqliteConn);
+            vacuumCmd.ExecuteNonQuery();
+            if (Environment.UserInteractive && !_config.Quiet)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("[SQLite] VACUUM ausgefuehrt");
+                Console.ResetColor();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("VACUUM fehlgeschlagen: {Message}", ex.Message);
+        }
+    }
+
+    private void CheckPeriodicCleanup()
+    {
+        if (_sqliteConn == null) return;
+        if ((DateTime.Now - _lastCleanup).TotalDays >= CleanupIntervalDays)
+        {
+            CreateBackup();
+            CleanupOldEntries();
+            CleanupBySize();
+        }
+    }
+
+    private void QueueEvent(DnsServerEvent evt)
+    {
+        if (_sqliteConn == null) return;
+
+        lock (_queueLock)
+        {
+            _eventQueue.Add(evt);
+            if (_eventQueue.Count >= BatchSize)
+                FlushEventQueueInternal();
+        }
+    }
+
+    private void FlushEventQueue()
+    {
+        lock (_queueLock)
+        {
+            FlushEventQueueInternal();
+        }
+    }
+
+    private void FlushEventQueueInternal()
+    {
+        if (_sqliteConn == null || _insertCmd == null || _eventQueue.Count == 0) return;
+
+        try
+        {
+            using var transaction = _sqliteConn.BeginTransaction();
+            _insertCmd.Transaction = transaction;
+
+            foreach (var evt in _eventQueue)
+            {
+                _insertCmd.Parameters["@timestamp"].Value = evt.Timestamp.ToString("o");
+                _insertCmd.Parameters["@event_type"].Value = evt.EventType;
+                _insertCmd.Parameters["@client_ip"].Value = evt.ClientIp ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@query_name"].Value = evt.QueryName ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@query_type"].Value = evt.QueryType ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@response_code"].Value = evt.ResponseCode ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@resolved_ips"].Value = evt.ResolvedIps ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@zone"].Value = evt.Zone ?? (object)DBNull.Value;
+                _insertCmd.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+            _eventQueue.Clear();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError("Batch-Write Fehler: {Message}", ex.Message);
+            _eventQueue.Clear();
+        }
+    }
+
     private static List<string> ParseDnsAnswers(byte[] packetData)
     {
         var answers = new List<string>();
@@ -80,257 +884,36 @@ class Program
                         answers.Add($"CAA:{caaRecord.Flags} {caaRecord.Tag} {caaRecord.Value}");
                         break;
                     default:
-                        // Alle anderen Record-Typen
                         answers.Add($"{record.RecordType}:{record}");
                         break;
                 }
             }
         }
-        catch
-        {
-            // Bei Parse-Fehlern: leere Liste zurueckgeben
-        }
+        catch { }
 
         return answers;
     }
 
-    // SQLite Datenbank initialisieren
-    private static void InitSqlite(string dbPath)
+    private static string GetEventName(int eventId) => eventId switch
     {
-        _sqliteConn = new SqliteConnection($"Data Source={dbPath}");
-        _sqliteConn.Open();
+        256 => "QUERY_RECEIVED",
+        257 => "RESPONSE_SUCCESS",
+        258 => "RECURSE_QUERY_OUT",
+        259 => "RECURSE_RESPONSE_IN",
+        260 => "QUERY_TIMEOUT",
+        261 => "RESPONSE_FAILURE",
+        280 => "INTERNAL_LOOKUP",
+        _ => $"EVENT_{eventId}"
+    };
 
-        // Tabelle erstellen
-        var createTable = @"
-            CREATE TABLE IF NOT EXISTS dns_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                client_ip TEXT,
-                query_name TEXT,
-                query_type TEXT,
-                response_code TEXT,
-                resolved_ips TEXT,
-                zone TEXT
-            );
-
-            -- Indices fuer schnelle Suche
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_client_ip ON dns_events(client_ip);
-            CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
-            CREATE INDEX IF NOT EXISTS idx_resolved_ips ON dns_events(resolved_ips);
-        ";
-
-        using var cmd = new SqliteCommand(createTable, _sqliteConn);
-        cmd.ExecuteNonQuery();
-
-        // Alte Eintraege loeschen (Retention)
-        CleanupOldEntries();
-    }
-
-    // Alte Eintraege loeschen
-    private static void CleanupOldEntries()
+    private void ProcessEvent(TraceEvent evt)
     {
-        if (_sqliteConn == null) return;
-
-        var cutoff = DateTime.Now.AddDays(-_retentionDays).ToString("o");
-        var deleteOld = $"DELETE FROM dns_events WHERE timestamp < @cutoff";
-
-        using var cmd = new SqliteCommand(deleteOld, _sqliteConn);
-        cmd.Parameters.AddWithValue("@cutoff", cutoff);
-        var deleted = cmd.ExecuteNonQuery();
-
-        if (deleted > 0)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"[SQLite] {deleted} Eintraege aelter als {_retentionDays} Tage geloescht");
-            Console.ResetColor();
-        }
-    }
-
-    // Event in SQLite speichern
-    private static void InsertEvent(
-        DateTime timestamp,
-        string eventType,
-        string? clientIp,
-        string? queryName,
-        string? queryType,
-        string? responseCode,
-        List<string> resolvedIps,
-        string? zone)
-    {
-        if (_sqliteConn == null) return;
-
-        try
-        {
-            var insert = @"
-                INSERT INTO dns_events
-                (timestamp, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone)
-                VALUES
-                (@timestamp, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone)
-            ";
-
-            using var cmd = new SqliteCommand(insert, _sqliteConn);
-            cmd.Parameters.AddWithValue("@timestamp", timestamp.ToString("o"));
-            cmd.Parameters.AddWithValue("@event_type", eventType);
-            cmd.Parameters.AddWithValue("@client_ip", clientIp ?? (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@query_name", queryName ?? (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@query_type", queryType ?? (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@response_code", responseCode ?? (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@resolved_ips", resolvedIps.Count > 0 ? string.Join(",", resolvedIps) : (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@zone", zone ?? (object)DBNull.Value);
-
-            cmd.ExecuteNonQuery();
-        }
-        catch (Exception ex)
-        {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[SQLite] Fehler: {ex.Message}");
-            Console.ResetColor();
-        }
-    }
-
-    static void Main(string[] args)
-    {
-        // Args parsen
-        _showRaw = args.Contains("--raw") || args.Contains("-r");
-        _jsonOutput = args.Contains("--json") || args.Contains("-j");
-        _quiet = args.Contains("--quiet") || args.Contains("-q");
-
-        var logArg = args.FirstOrDefault(a => a.StartsWith("--log=") || a.StartsWith("-l="));
-        if (logArg != null)
-        {
-            _logFile = logArg.Split('=')[1];
-            _logWriter = new StreamWriter(_logFile, append: true) { AutoFlush = true };
-        }
-
-        // SQLite Argument
-        var sqliteArg = args.FirstOrDefault(a => a.StartsWith("--sqlite=") || a.StartsWith("-s="));
-        if (sqliteArg != null)
-        {
-            _sqliteDb = sqliteArg.Split('=')[1];
-        }
-
-        // Retention Argument (Tage)
-        var retentionArg = args.FirstOrDefault(a => a.StartsWith("--retention="));
-        if (retentionArg != null && int.TryParse(retentionArg.Split('=')[1], out int days))
-        {
-            _retentionDays = days;
-        }
-
-        if (args.Contains("--help") || args.Contains("-h"))
-        {
-            PrintHelp();
-            return;
-        }
-
-        // Admin-Check
-        if (!TraceEventSession.IsElevated() ?? false)
-        {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("FEHLER: Muss als Administrator ausgefuehrt werden!");
-            Console.ResetColor();
-            return;
-        }
-
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine();
-        Console.WriteLine("========================================");
-        Console.WriteLine("  DNS Server Real-Time ETW Watcher");
-        Console.WriteLine("========================================");
-        Console.ResetColor();
-        Console.WriteLine();
-
-        // SQLite initialisieren falls angegeben
-        if (_sqliteDb != null)
-        {
-            try
-            {
-                InitSqlite(_sqliteDb);
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[OK] SQLite Datenbank: {_sqliteDb}");
-                Console.WriteLine($"     Retention: {_retentionDays} Tage");
-                Console.ResetColor();
-            }
-            catch (Exception ex)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[FEHLER] SQLite: {ex.Message}");
-                Console.ResetColor();
-                return;
-            }
-        }
-
-        var sessionName = $"DnsServerWatcher_{Environment.ProcessId}";
-
-        // Alte Session beenden falls vorhanden
-        try
-        {
-            using var oldSession = TraceEventSession.GetActiveSession(sessionName);
-            oldSession?.Stop();
-        }
-        catch { }
-
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"Starte ETW Session: {sessionName}");
-        Console.ResetColor();
-
-        using var session = new TraceEventSession(sessionName);
-
-        // Ctrl+C Handler
-        Console.CancelKeyPress += (s, e) =>
-        {
-            e.Cancel = true;
-            Console.WriteLine();
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("Beende...");
-            Console.ResetColor();
-            session.Stop();
-        };
-
-        // Event Handler registrieren
-        session.Source.Dynamic.All += ProcessEvent;
-
-        // DNS Server Provider aktivieren
-        session.EnableProvider(DnsServerProviderGuid, TraceEventLevel.Verbose, ulong.MaxValue);
-
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine("[OK] DNS Server Provider aktiviert");
-        Console.WriteLine();
-        Console.WriteLine("==========================================");
-        Console.WriteLine("  LIVE - Warte auf DNS Events (Ctrl+C)");
-        Console.WriteLine("==========================================");
-        Console.ResetColor();
-        Console.WriteLine();
-
-        if (!_jsonOutput)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine("Legende: QUERY=Anfrage empfangen, RESPONSE=Antwort gesendet");
-            Console.WriteLine();
-            Console.ResetColor();
-        }
-
-        // Event Processing starten (blockiert bis Stop)
-        session.Source.Process();
-
-        _logWriter?.Close();
-        _sqliteConn?.Close();
-        Console.WriteLine("Fertig.");
-    }
-
-    private static void ProcessEvent(TraceEvent evt)
-    {
-        // Header Events ignorieren
         if (evt.ID == 0) return;
 
         var timestamp = evt.TimeStamp.ToString("HH:mm:ss.fff");
         var eventId = (int)evt.ID;
 
-        // Event-Daten extrahieren
-        string? qname = null, source = null, dest = null, qtype = null, rcode = null;
-        string? zone = null, interfaceIp = null;
-        int qtypeNum = 0;
+        string? qname = null, source = null, dest = null, qtype = null, rcode = null, zone = null;
         byte[]? packetData = null;
         List<string> resolvedIps = new();
 
@@ -342,31 +925,22 @@ class Program
 
             var qtypeVal = evt.PayloadByName("QTYPE");
             if (qtypeVal != null && int.TryParse(qtypeVal.ToString()?.Trim(), out int qt))
-            {
-                qtypeNum = qt;
                 qtype = QueryTypes.TryGetValue(qt, out var qtName) ? qtName : qt.ToString();
-            }
 
             var rcodeVal = evt.PayloadByName("RCODE");
             if (rcodeVal != null && int.TryParse(rcodeVal.ToString()?.Trim(), out int rc))
-            {
                 rcode = ResponseCodes.TryGetValue(rc, out var rcName) ? rcName : rc.ToString();
-            }
 
             zone = evt.PayloadByName("Zone")?.ToString();
-            interfaceIp = evt.PayloadByName("InterfaceIP")?.ToString();
 
-            // PacketData fuer Record-Extraktion
             packetData = evt.PayloadByName("PacketData") as byte[];
             if (packetData != null && eventId == 257 && (rcode == "OK" || rcode == "0"))
-            {
                 resolvedIps = ParseDnsAnswers(packetData);
-            }
         }
         catch { }
 
         // JSON Output
-        if (_jsonOutput)
+        if (_config.JsonOutput)
         {
             var json = System.Text.Json.JsonSerializer.Serialize(new
             {
@@ -379,8 +953,7 @@ class Program
                 queryType = qtype,
                 responseCode = rcode,
                 resolvedAddresses = resolvedIps.Count > 0 ? resolvedIps : null,
-                zone,
-                interfaceIp
+                zone
             });
             Console.WriteLine(json);
             _logWriter?.WriteLine(json);
@@ -399,31 +972,30 @@ class Program
             _logWriter.WriteLine(line);
         }
 
-        // SQLite speichern (nur Query und Response, nicht Lookup)
+        // SQLite speichern
         if (_sqliteConn != null && (eventId == 256 || eventId == 257))
         {
             var eventType = eventId == 256 ? "QUERY" : "RESPONSE";
             var clientIp = eventId == 256 ? source : dest;
-            InsertEvent(evt.TimeStamp, eventType, clientIp, qname, qtype, rcode, resolvedIps, zone);
+            var dnsEvent = new DnsServerEvent(
+                evt.TimeStamp, eventType, clientIp, qname, qtype, rcode,
+                resolvedIps.Count > 0 ? string.Join(",", resolvedIps) : null, zone);
+            QueueEvent(dnsEvent);
+            Interlocked.Increment(ref _eventCount);
+            CheckPeriodicCleanup();
         }
 
-        // Im Quiet-Mode keine Console-Ausgabe
-        if (_quiet)
-            return;
-
-        // Event 280 (LOOKUP) frueh filtern - vor Timestamp-Ausgabe
-        if (eventId == 280 && !_showRaw) return;
-
-        // Nur bekannte Events anzeigen (256=Query, 257=Response, 280=Lookup wenn raw)
+        // Console-Ausgabe
+        if (_config.Quiet || !Environment.UserInteractive) return;
+        if (eventId == 280 && !_config.ShowRaw) return;
         if (eventId != 256 && eventId != 257 && eventId != 280) return;
 
-        // Formatierte Ausgabe
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.Write($"[{timestamp}] ");
 
         switch (eventId)
         {
-            case 256: // QUERY_RECEIVED
+            case 256:
                 Console.ForegroundColor = ConsoleColor.White;
                 Console.Write("QUERY    ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
@@ -437,7 +1009,7 @@ class Program
                 Console.WriteLine($"[{qtype ?? "?"}]");
                 break;
 
-            case 257: // RESPONSE_SUCCESS
+            case 257:
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.Write("RESPONSE ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
@@ -451,7 +1023,6 @@ class Program
                 Console.Write($"[{qtype ?? "?"}] ");
                 Console.ForegroundColor = rcode == "OK" ? ConsoleColor.Green : ConsoleColor.Red;
                 Console.Write(rcode ?? "?");
-                // Zeige aufgeloeste IP-Adressen
                 if (resolvedIps.Count > 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Magenta;
@@ -460,7 +1031,7 @@ class Program
                 Console.WriteLine();
                 break;
 
-            case 280: // Internal lookup (nur bei --raw)
+            case 280:
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.Write("LOOKUP   ");
                 Console.WriteLine($"{qname} [{qtype}]");
@@ -469,76 +1040,24 @@ class Program
 
         Console.ResetColor();
 
-        // Raw output
-        if (_showRaw)
+        if (_config.ShowRaw)
         {
             Console.ForegroundColor = ConsoleColor.DarkGray;
             for (int i = 0; i < evt.PayloadNames.Length; i++)
-            {
                 Console.WriteLine($"    {evt.PayloadNames[i]} = {evt.PayloadValue(i)}");
-            }
             Console.ResetColor();
         }
     }
-
-    private static string GetEventName(int eventId) => eventId switch
-    {
-        256 => "QUERY_RECEIVED",
-        257 => "RESPONSE_SUCCESS",
-        258 => "RECURSE_QUERY_OUT",
-        259 => "RECURSE_RESPONSE_IN",
-        260 => "QUERY_TIMEOUT",
-        261 => "RESPONSE_FAILURE",
-        280 => "INTERNAL_LOOKUP",
-        _ => $"EVENT_{eventId}"
-    };
-
-    private static void PrintHelp()
-    {
-        Console.WriteLine(@"
-DNS Server Real-Time ETW Watcher
-================================
-
-Zeigt DNS Server Events in Echtzeit an.
-Muss als Administrator ausgefuehrt werden.
-
-Verwendung:
-  DnsServerWatcher.exe [optionen]
-
-Optionen:
-  -r, --raw          Zeige alle Event-Properties
-  -j, --json         Ausgabe als JSON (eine Zeile pro Event)
-  -q, --quiet        Keine Console-Ausgabe (nur SQLite/Log schreiben)
-  -l, --log=X        Schreibe Events zusaetzlich in Datei X
-  -s, --sqlite=X     Speichere Events in SQLite Datenbank X
-      --retention=N  Behalte Eintraege fuer N Tage (default: 30)
-  -h, --help         Diese Hilfe anzeigen
-
-Beispiele:
-  DnsServerWatcher.exe
-  DnsServerWatcher.exe --json --log=C:\Logs\dns.jsonl
-  DnsServerWatcher.exe --sqlite=C:\Logs\dns.db
-  DnsServerWatcher.exe --sqlite=C:\Logs\dns.db --retention=90
-  DnsServerWatcher.exe --sqlite=C:\Logs\dns.db --quiet
-  DnsServerWatcher.exe -r
-
-SQLite-Abfragen (nach dem Sammeln):
-  -- IP-Adresse suchen:
-  SELECT * FROM dns_events WHERE resolved_ips LIKE '%142.250.185.110%';
-
-  -- Client-Aktivitaet:
-  SELECT * FROM dns_events WHERE client_ip = '10.0.0.51' ORDER BY timestamp DESC;
-
-  -- Domain suchen:
-  SELECT * FROM dns_events WHERE query_name LIKE '%google%';
-
-Event-Typen:
-  256 = Query empfangen
-  257 = Response gesendet (OK)
-  258 = Rekursive Query ausgehend
-  259 = Rekursive Response eingehend
-  260 = Query Timeout
-  261 = Response Fehler
-");
-    }
 }
+
+// Event-Struktur
+public record DnsServerEvent(
+    DateTime Timestamp,
+    string EventType,
+    string? ClientIp,
+    string? QueryName,
+    string? QueryType,
+    string? ResponseCode,
+    string? ResolvedIps,
+    string? Zone
+);
