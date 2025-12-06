@@ -115,7 +115,7 @@ LIMIT 20;
 
 - ETW Provider: `Microsoft-Windows-DNSServer` (`EB79061A-A566-4698-9119-3ED2807060E7`)
 - Event-IDs: 256 (Query), 257 (Response), 258-261 (Rekursion/Fehler), 280 (Lookup)
-- DNS-Paket-Parsing via [DNS Library](https://github.com/kapetan/dns) für robuste Record-Extraktion
+- DNS-Paket-Parsing via [ARSoft.Tools.Net](https://github.com/alexreinert/ARSoft.Tools.Net) - implementiert 60+ RFCs inkl. DNSSEC, EDNS
 - Self-contained Single-File Executable
 
 ## Siehe auch

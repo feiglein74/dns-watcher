@@ -2,8 +2,7 @@ using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Data.Sqlite;
 using System.Net;
-using DNS.Protocol;
-using DNS.Protocol.ResourceRecords;
+using ARSoft.Tools.Net.Dns;
 
 namespace DnsServerWatcher;
 
@@ -34,7 +33,8 @@ class Program
     private static int _retentionDays = 30;
 
     // DNS Packet Parser - extrahiert Records aus der Answer Section
-    // Nutzt die DNS Library (https://github.com/kapetan/dns) fuer robustes Parsing
+    // Nutzt ARSoft.Tools.Net (https://github.com/alexreinert/ARSoft.Tools.Net)
+    // Implementiert 60+ RFCs inkl. DNSSEC, EDNS, DANE
     private static List<string> ParseDnsAnswers(byte[] packetData)
     {
         var answers = new List<string>();
@@ -42,39 +42,45 @@ class Program
 
         try
         {
-            var response = Response.FromArray(packetData);
+            var message = DnsMessage.Parse(packetData);
 
-            foreach (var record in response.AnswerRecords)
+            foreach (var record in message.AnswerRecords)
             {
                 switch (record)
                 {
-                    case IPAddressResourceRecord ipRecord:
-                        // A und AAAA Records
-                        answers.Add(ipRecord.IPAddress.ToString());
+                    case ARecord aRecord:
+                        answers.Add(aRecord.Address.ToString());
                         break;
-                    case CanonicalNameResourceRecord cnameRecord:
-                        // CNAME Records
-                        answers.Add($"CNAME:{cnameRecord.CanonicalDomainName}");
+                    case AaaaRecord aaaaRecord:
+                        answers.Add(aaaaRecord.Address.ToString());
                         break;
-                    case MailExchangeResourceRecord mxRecord:
-                        // MX Records
+                    case CNameRecord cnameRecord:
+                        answers.Add($"CNAME:{cnameRecord.CanonicalName}");
+                        break;
+                    case MxRecord mxRecord:
                         answers.Add($"MX:{mxRecord.Preference} {mxRecord.ExchangeDomainName}");
                         break;
-                    case NameServerResourceRecord nsRecord:
-                        // NS Records
-                        answers.Add($"NS:{nsRecord.NSDomainName}");
+                    case NsRecord nsRecord:
+                        answers.Add($"NS:{nsRecord.NameServer}");
                         break;
-                    case PointerResourceRecord ptrRecord:
-                        // PTR Records (Reverse DNS)
+                    case PtrRecord ptrRecord:
                         answers.Add($"PTR:{ptrRecord.PointerDomainName}");
                         break;
-                    case TextResourceRecord txtRecord:
-                        // TXT Records
-                        answers.Add($"TXT:{txtRecord.ToStringTextData()}");
+                    case TxtRecord txtRecord:
+                        answers.Add($"TXT:{string.Join(" ", txtRecord.TextData)}");
+                        break;
+                    case SrvRecord srvRecord:
+                        answers.Add($"SRV:{srvRecord.Priority} {srvRecord.Weight} {srvRecord.Port} {srvRecord.Target}");
+                        break;
+                    case SoaRecord soaRecord:
+                        answers.Add($"SOA:{soaRecord.MasterName} {soaRecord.ResponsibleName}");
+                        break;
+                    case CAARecord caaRecord:
+                        answers.Add($"CAA:{caaRecord.Flags} {caaRecord.Tag} {caaRecord.Value}");
                         break;
                     default:
-                        // Andere Record-Typen: Zeige Typ und Rohdaten
-                        answers.Add($"{record.Type}:{record}");
+                        // Alle anderen Record-Typen
+                        answers.Add($"{record.RecordType}:{record}");
                         break;
                 }
             }

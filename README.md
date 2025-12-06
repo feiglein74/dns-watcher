@@ -49,7 +49,7 @@ Real-Time DNS Event Monitoring Tools für Windows via ETW (Event Tracing for Win
 - Ausgabe: Console, JSON, Logfile, SQLite
 - SQLite mit konfigurierbarer Retention
 - Administrator-Rechte erforderlich
-- DNS-Paket-Parsing via [DNS Library](https://github.com/kapetan/dns)
+- DNS-Paket-Parsing via [ARSoft.Tools.Net](https://github.com/alexreinert/ARSoft.Tools.Net) (60+ RFCs)
 
 ## Build
 
