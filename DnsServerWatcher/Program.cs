@@ -26,6 +26,7 @@ class Program
 
     private static bool _showRaw = false;
     private static bool _jsonOutput = false;
+    private static bool _quiet = false;
     private static string? _logFile = null;
     private static StreamWriter? _logWriter = null;
     private static string? _sqliteDb = null;
@@ -194,6 +195,7 @@ class Program
         // Args parsen
         _showRaw = args.Contains("--raw") || args.Contains("-r");
         _jsonOutput = args.Contains("--json") || args.Contains("-j");
+        _quiet = args.Contains("--quiet") || args.Contains("-q");
 
         var logArg = args.FirstOrDefault(a => a.StartsWith("--log=") || a.StartsWith("-l="));
         if (logArg != null)
@@ -385,6 +387,30 @@ class Program
             return;
         }
 
+        // Log to file
+        if (_logWriter != null && (eventId == 256 || eventId == 257))
+        {
+            var line = eventId switch
+            {
+                256 => $"{evt.TimeStamp:O}\tQUERY\t{source}\t{qname}\t{qtype}",
+                257 => $"{evt.TimeStamp:O}\tRESPONSE\t{dest}\t{qname}\t{qtype}\t{rcode}",
+                _ => $"{evt.TimeStamp:O}\t{eventId}\t{source ?? dest}\t{qname}\t{qtype}"
+            };
+            _logWriter.WriteLine(line);
+        }
+
+        // SQLite speichern (nur Query und Response, nicht Lookup)
+        if (_sqliteConn != null && (eventId == 256 || eventId == 257))
+        {
+            var eventType = eventId == 256 ? "QUERY" : "RESPONSE";
+            var clientIp = eventId == 256 ? source : dest;
+            InsertEvent(evt.TimeStamp, eventType, clientIp, qname, qtype, rcode, resolvedIps, zone);
+        }
+
+        // Im Quiet-Mode keine Console-Ausgabe
+        if (_quiet)
+            return;
+
         // Event 280 (LOOKUP) frueh filtern - vor Timestamp-Ausgabe
         if (eventId == 280 && !_showRaw) return;
 
@@ -443,26 +469,6 @@ class Program
 
         Console.ResetColor();
 
-        // Log to file
-        if (_logWriter != null)
-        {
-            var line = eventId switch
-            {
-                256 => $"{evt.TimeStamp:O}\tQUERY\t{source}\t{qname}\t{qtype}",
-                257 => $"{evt.TimeStamp:O}\tRESPONSE\t{dest}\t{qname}\t{qtype}\t{rcode}",
-                _ => $"{evt.TimeStamp:O}\t{eventId}\t{source ?? dest}\t{qname}\t{qtype}"
-            };
-            _logWriter.WriteLine(line);
-        }
-
-        // SQLite speichern (nur Query und Response, nicht Lookup)
-        if (_sqliteConn != null && (eventId == 256 || eventId == 257))
-        {
-            var eventType = eventId == 256 ? "QUERY" : "RESPONSE";
-            var clientIp = eventId == 256 ? source : dest;
-            InsertEvent(evt.TimeStamp, eventType, clientIp, qname, qtype, rcode, resolvedIps, zone);
-        }
-
         // Raw output
         if (_showRaw)
         {
@@ -502,6 +508,7 @@ Verwendung:
 Optionen:
   -r, --raw          Zeige alle Event-Properties
   -j, --json         Ausgabe als JSON (eine Zeile pro Event)
+  -q, --quiet        Keine Console-Ausgabe (nur SQLite/Log schreiben)
   -l, --log=X        Schreibe Events zusaetzlich in Datei X
   -s, --sqlite=X     Speichere Events in SQLite Datenbank X
       --retention=N  Behalte Eintraege fuer N Tage (default: 30)
@@ -512,6 +519,7 @@ Beispiele:
   DnsServerWatcher.exe --json --log=C:\Logs\dns.jsonl
   DnsServerWatcher.exe --sqlite=C:\Logs\dns.db
   DnsServerWatcher.exe --sqlite=C:\Logs\dns.db --retention=90
+  DnsServerWatcher.exe --sqlite=C:\Logs\dns.db --quiet
   DnsServerWatcher.exe -r
 
 SQLite-Abfragen (nach dem Sammeln):

@@ -1,6 +1,7 @@
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Data.Sqlite;
+using System.Diagnostics;
 using System.Net;
 
 namespace DnsClientWatcher;
@@ -53,8 +54,33 @@ class Program
         };
     }
 
+    // Cache fuer Prozessnamen (PID -> Name)
+    private static readonly Dictionary<int, string> _processNameCache = new();
+
+    private static string GetProcessName(int processId)
+    {
+        if (processId <= 0) return "?";
+
+        if (_processNameCache.TryGetValue(processId, out var cached))
+            return cached;
+
+        try
+        {
+            using var proc = Process.GetProcessById(processId);
+            var name = proc.ProcessName;
+            _processNameCache[processId] = name;
+            return name;
+        }
+        catch
+        {
+            // Prozess existiert nicht mehr
+            return $"PID:{processId}";
+        }
+    }
+
     private static bool _showRaw = false;
     private static bool _jsonOutput = false;
+    private static bool _quiet = false;
     private static string? _logFile = null;
     private static StreamWriter? _logWriter = null;
     private static string? _sqliteDb = null;
@@ -74,6 +100,8 @@ class Program
                 timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 event_id INTEGER,
+                process_id INTEGER,
+                process_name TEXT,
                 query_name TEXT,
                 query_type TEXT,
                 status TEXT,
@@ -84,6 +112,7 @@ class Program
 
             -- Indices fuer schnelle Suche
             CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_process_name ON dns_events(process_name);
             CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
             CREATE INDEX IF NOT EXISTS idx_query_results ON dns_events(query_results);
         ";
@@ -120,6 +149,8 @@ class Program
         DateTime timestamp,
         string eventType,
         int eventId,
+        int processId,
+        string processName,
         string? queryName,
         string? queryType,
         string? status,
@@ -133,15 +164,17 @@ class Program
         {
             var insert = @"
                 INSERT INTO dns_events
-                (timestamp, event_type, event_id, query_name, query_type, status, query_results, dns_server, interface_index)
+                (timestamp, event_type, event_id, process_id, process_name, query_name, query_type, status, query_results, dns_server, interface_index)
                 VALUES
-                (@timestamp, @event_type, @event_id, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index)
+                (@timestamp, @event_type, @event_id, @process_id, @process_name, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index)
             ";
 
             using var cmd = new SqliteCommand(insert, _sqliteConn);
             cmd.Parameters.AddWithValue("@timestamp", timestamp.ToString("o"));
             cmd.Parameters.AddWithValue("@event_type", eventType);
             cmd.Parameters.AddWithValue("@event_id", eventId);
+            cmd.Parameters.AddWithValue("@process_id", processId);
+            cmd.Parameters.AddWithValue("@process_name", processName);
             cmd.Parameters.AddWithValue("@query_name", queryName ?? (object)DBNull.Value);
             cmd.Parameters.AddWithValue("@query_type", queryType ?? (object)DBNull.Value);
             cmd.Parameters.AddWithValue("@status", status ?? (object)DBNull.Value);
@@ -164,6 +197,7 @@ class Program
         // Args parsen
         _showRaw = args.Contains("--raw") || args.Contains("-r");
         _jsonOutput = args.Contains("--json") || args.Contains("-j");
+        _quiet = args.Contains("--quiet") || args.Contains("-q");
 
         var logArg = args.FirstOrDefault(a => a.StartsWith("--log=") || a.StartsWith("-l="));
         if (logArg != null)
@@ -294,6 +328,8 @@ class Program
 
         var timestamp = evt.TimeStamp.ToString("HH:mm:ss.fff");
         var eventId = (int)evt.ID;
+        var processId = evt.ProcessID;
+        var processName = GetProcessName(processId);
 
         // Event-Daten extrahieren
         string? queryName = null, queryResults = null, dnsServer = null;
@@ -337,6 +373,8 @@ class Program
                 timestamp = evt.TimeStamp,
                 eventId,
                 eventName = GetEventName(eventId),
+                processId,
+                processName,
                 queryName,
                 queryType = qtype,
                 status,
@@ -348,6 +386,24 @@ class Program
             _logWriter?.WriteLine(json);
             return;
         }
+
+        // Log to file
+        if (_logWriter != null)
+        {
+            var line = $"{evt.TimeStamp:O}\t{eventId}\t{GetEventName(eventId)}\t{queryName}\t{qtype}\t{status}\t{queryResults}";
+            _logWriter.WriteLine(line);
+        }
+
+        // SQLite speichern
+        if (_sqliteConn != null && (eventId == 3006 || eventId == 3008 || eventId == 3018 || eventId == 3020))
+        {
+            var eventType = GetEventName(eventId);
+            InsertEvent(evt.TimeStamp, eventType, eventId, processId, processName, queryName, qtype, status, queryResults, dnsServer, interfaceIndex > 0 ? interfaceIndex : null);
+        }
+
+        // Im Quiet-Mode keine Console-Ausgabe
+        if (_quiet)
+            return;
 
         // Nur interessante Events anzeigen
         // 3006 = Query Start, 3008 = Query Response, 3009 = Query to Server, 3018 = Cache Hit, 3020 = Response
@@ -367,7 +423,9 @@ class Program
                 Console.Write(queryName ?? "?");
                 Console.Write(" ");
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[{qtype ?? "?"}]");
+                Console.Write($"[{qtype ?? "?"}]");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
                 break;
 
             case 3008: // Query Complete
@@ -446,20 +504,6 @@ class Program
 
         Console.ResetColor();
 
-        // Log to file
-        if (_logWriter != null)
-        {
-            var line = $"{evt.TimeStamp:O}\t{eventId}\t{GetEventName(eventId)}\t{queryName}\t{qtype}\t{status}\t{queryResults}";
-            _logWriter.WriteLine(line);
-        }
-
-        // SQLite speichern
-        if (_sqliteConn != null && (eventId == 3006 || eventId == 3008 || eventId == 3018 || eventId == 3020))
-        {
-            var eventType = GetEventName(eventId);
-            InsertEvent(evt.TimeStamp, eventType, eventId, queryName, qtype, status, queryResults, dnsServer, interfaceIndex > 0 ? interfaceIndex : null);
-        }
-
         // Raw output
         if (_showRaw)
         {
@@ -498,6 +542,7 @@ Verwendung:
 Optionen:
   -r, --raw          Zeige alle Event-Properties
   -j, --json         Ausgabe als JSON (eine Zeile pro Event)
+  -q, --quiet        Keine Console-Ausgabe (nur SQLite/Log schreiben)
   -l, --log=X        Schreibe Events zusaetzlich in Datei X
   -s, --sqlite=X     Speichere Events in SQLite Datenbank X
       --retention=N  Behalte Eintraege fuer N Tage (default: 30)
@@ -508,6 +553,7 @@ Beispiele:
   DnsClientWatcher.exe --json --log=C:\Logs\dnsclient.jsonl
   DnsClientWatcher.exe --sqlite=C:\Logs\dnsclient.db
   DnsClientWatcher.exe --sqlite=C:\Logs\dnsclient.db --retention=90
+  DnsClientWatcher.exe --sqlite=C:\Logs\dnsclient.db --quiet
   DnsClientWatcher.exe -r
 
 SQLite-Abfragen (nach dem Sammeln):
