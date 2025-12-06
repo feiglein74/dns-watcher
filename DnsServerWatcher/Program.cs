@@ -438,7 +438,15 @@ public class DnsServerWatcherService : BackgroundService
     {
         { 1, "A" }, { 2, "NS" }, { 5, "CNAME" }, { 6, "SOA" },
         { 12, "PTR" }, { 15, "MX" }, { 16, "TXT" }, { 28, "AAAA" },
-        { 33, "SRV" }, { 255, "ANY" }, { 65, "HTTPS" }
+        { 33, "SRV" }, { 35, "NAPTR" }, { 37, "CERT" },
+        // DNSSEC
+        { 43, "DS" }, { 46, "RRSIG" }, { 47, "NSEC" }, { 48, "DNSKEY" },
+        { 50, "NSEC3" }, { 51, "NSEC3PARAM" },
+        // TSIG/TKEY
+        { 249, "TKEY" }, { 250, "TSIG" },
+        // Sonstige
+        { 52, "TLSA" }, { 64, "SVCB" }, { 65, "HTTPS" },
+        { 99, "SPF" }, { 255, "ANY" }, { 257, "CAA" }
     };
 
     private static readonly Dictionary<int, string> ResponseCodes = new()
