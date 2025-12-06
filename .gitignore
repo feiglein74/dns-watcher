@@ -1,0 +1,27 @@
+# Build-Artefakte
+bin/
+obj/
+publish/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Claude Code (projekt-spezifischer Kontext)
+.claude/
+CLAUDE.md
+
+# Logs und Datenbanken (zur Laufzeit erzeugt)
+*.log
+*.db
+*.sqlite
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporäre Dateien
+*.tmp
+*.temp
