@@ -103,7 +103,21 @@ Bekannte Event-Typen werden mit Namen angezeigt. Unbekannte Events erscheinen al
 | `CNAME_LOOKUP` | 279 | Interner CNAME-Lookup (Aufloesung eines CNAME-Ziels) |
 | `LOOKUP` | 280 | DNS-Lookup Event |
 | `DYN_UPDATE_REC` | 519, 520 | Dynamic DNS Update Audit-Record |
+| `CACHE_OP` | 536 | Cache-Operation (AUDIT_CACHE) |
+| `ZONE_SETTING` | 541 | Zone-Einstellung geaendert |
+| `CONFIG` | 65208-65279 | DNS Server Shutdown/Diagnostics (undokumentiert) |
 | `EVENT_XXX` | andere | Alle anderen Events (Zone Transfers, etc.) |
+
+**Hinweis zu CONFIG Events:**
+Die Events 65208-65279 werden beim DNS Server Shutdown ausgegeben und enthalten Konfigurations-Werte.
+Diese Events sind von Microsoft nicht dokumentiert. Der Payload wird als JSON in `raw_payload` gespeichert.
+
+Bekannte Payloads (Auswahl):
+- 65270: `{"IsRRlEnabled":0}` - Response Rate Limiting
+- 65276: `{"IsSingleLabelRecursionEnabled":0}`
+- 65277: `{"IsAnalyticPacketDataDisabled":0}`
+- 65278: `{"IsAnalyticChannelEnabled":1}`
+- 65279: `{"IsLegacyPacketLoggingEnabled":0}`
 
 ### Response Codes
 

@@ -1106,8 +1106,12 @@ public class DnsServerWatcherService : BackgroundService
         264 => "DYN_UPDATE_RESP",
         519 => "DYN_UPDATE_REC",
         520 => "DYN_UPDATE_REC",
+        536 => "CACHE_OP",
+        541 => "ZONE_SETTING",
         279 => "CNAME_LOOKUP",
         280 => "INTERNAL_LOOKUP",
+        // CONFIG Events (65208-65279): DNS Server Shutdown/Diagnostics
+        >= 65000 and <= 65535 => $"CONFIG_{eventId}",
         _ => $"EVENT_{eventId}"
     };
 
@@ -1195,6 +1199,10 @@ public class DnsServerWatcherService : BackgroundService
             279 => "CNAME_LOOKUP",
             280 => "LOOKUP",
             519 or 520 => "DYN_UPDATE_REC",
+            536 => "CACHE_OP",
+            541 => "ZONE_SETTING",
+            // CONFIG Events (65208-65279): DNS Server Shutdown/Diagnostics
+            >= 65000 and <= 65535 => "CONFIG",
             _ => $"EVENT_{eventId}"
         };
 
@@ -1212,12 +1220,15 @@ public class DnsServerWatcherService : BackgroundService
             var resolvedInfo = parseError ?? (resolvedIps.Count > 0 ? string.Join(",", resolvedIps) : null);
 
             // raw_payload nur bei unbekannten Events speichern
+            // CONFIG Events (65xxx) bekommen trotzdem raw_payload, da undokumentiert
             string? rawPayload = null;
             var isKnownEvent = eventId == 256 || eventId == 257 || eventId == 258 ||
                                eventId == 259 || eventId == 260 || eventId == 261 ||
                                eventId == 263 || eventId == 264 || eventId == 279 ||
-                               eventId == 280 || eventId == 519 || eventId == 520;
-            if (!isKnownEvent)
+                               eventId == 280 || eventId == 519 || eventId == 520 ||
+                               eventId == 536 || eventId == 541;
+            var isConfigEvent = eventId >= 65000 && eventId <= 65535;
+            if (!isKnownEvent || isConfigEvent)
             {
                 try
                 {

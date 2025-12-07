@@ -17,6 +17,12 @@
 - [ ] Prozess-Tracking: Welcher Prozess hat die DNS-Anfrage gemacht
 - [ ] `--no-cache` Option um Cache-Events zu unterdrücken
 
+### DnsServerWatcher
+- [ ] CONFIG Events (65208-65279) analysieren und dokumentieren
+  - Undokumentierte DNS Server Shutdown/Diagnostics Events
+  - Payloads enthalten Konfig-Werte wie `IsRRlEnabled`, `IsAnalyticChannelEnabled`
+  - Eventuell Mapping auf bekannte DnsServerDiagnostics-Properties
+
 ## Priorität 2 - Nice to Have
 
 ### Beide Tools

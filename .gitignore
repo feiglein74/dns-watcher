@@ -25,3 +25,6 @@ Thumbs.db
 # Temporäre Dateien
 *.tmp
 *.temp
+
+# Lokale Tools (nicht Teil des Projekts)
+DbAnalyzer/
