@@ -88,7 +88,7 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 | `QUERY` | 256 | DNS-Anfrage empfangen |
 | `RESPONSE` | 257 | DNS-Antwort gesendet |
 | `TIMEOUT` | 260 | Anfrage Timeout |
-| `FAILURE` | 261 | Antwort fehlgeschlagen |
+| `RECURSE` | 261 | Antwort von Upstream-Server (rekursive Aufloesung) |
 
 ### Response Codes
 

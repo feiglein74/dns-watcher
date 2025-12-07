@@ -1113,7 +1113,7 @@ public class DnsServerWatcherService : BackgroundService
                 256 => "QUERY",
                 257 => "RESPONSE",
                 260 => "TIMEOUT",
-                261 => "FAILURE",
+                261 => "RECURSE",
                 _ => $"EVENT_{eventId}"
             };
             var clientIp = eventId == 256 ? source : dest;
@@ -1200,19 +1200,24 @@ public class DnsServerWatcherService : BackgroundService
                 break;
 
             case 261:
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.Write("FAILURE  ");
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.Write(dest ?? source ?? "?");
+                // RECURSE: Antwort vom Upstream-Server (rekursive Auflösung)
+                Console.ForegroundColor = ConsoleColor.DarkCyan;
+                Console.Write("RECURSE  ");
                 Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(dest ?? source ?? "?");
                 Console.Write(" <- ");
-                Console.ForegroundColor = ConsoleColor.White;
+                Console.ForegroundColor = ConsoleColor.Gray;
                 Console.Write(qname ?? "?");
                 Console.Write(" ");
-                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.ForegroundColor = ConsoleColor.DarkCyan;
                 Console.Write($"[{qtype ?? "?"}] ");
-                Console.ForegroundColor = ConsoleColor.Red;
+                Console.ForegroundColor = rcode == "OK" ? ConsoleColor.DarkGreen : ConsoleColor.DarkYellow;
                 Console.Write(rcode ?? "?");
+                if (resolvedIps.Count > 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkMagenta;
+                    Console.Write(" => " + string.Join(", ", resolvedIps));
+                }
                 if (parseError != null)
                 {
                     Console.ForegroundColor = ConsoleColor.DarkRed;
