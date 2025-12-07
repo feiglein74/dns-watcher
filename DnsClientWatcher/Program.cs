@@ -709,6 +709,9 @@ public class DnsClientWatcherService : BackgroundService
         using (var walCmd = new SqliteCommand("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", _sqliteConn))
             walCmd.ExecuteNonQuery();
 
+        // Schema-Migration zuerst, dann Tabelle erstellen
+        MigrateSchema();
+
         var createTable = @"
             CREATE TABLE IF NOT EXISTS dns_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -734,9 +737,6 @@ public class DnsClientWatcherService : BackgroundService
 
         using var cmd = new SqliteCommand(createTable, _sqliteConn);
         cmd.ExecuteNonQuery();
-
-        // Schema-Migration: Fehlende Spalten hinzufuegen
-        MigrateSchema();
 
         _insertCmd = new SqliteCommand(@"
             INSERT INTO dns_events
@@ -892,40 +892,89 @@ public class DnsClientWatcherService : BackgroundService
         }
     }
 
+    private const int CurrentSchemaVersion = 2;
+
+    private int GetSchemaVersion()
+    {
+        if (_sqliteConn == null) return 0;
+
+        // Pruefen ob schema_version Tabelle existiert
+        using var checkCmd = new SqliteCommand(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'", _sqliteConn);
+        var exists = checkCmd.ExecuteScalar() != null;
+
+        if (!exists) return 1; // Alte DB ohne Versionstabelle = Version 1
+
+        using var versionCmd = new SqliteCommand("SELECT version FROM schema_version LIMIT 1", _sqliteConn);
+        var result = versionCmd.ExecuteScalar();
+        return result != null ? Convert.ToInt32(result) : 1;
+    }
+
+    private void SetSchemaVersion(int version)
+    {
+        if (_sqliteConn == null) return;
+
+        using var createCmd = new SqliteCommand(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)", _sqliteConn);
+        createCmd.ExecuteNonQuery();
+
+        using var deleteCmd = new SqliteCommand("DELETE FROM schema_version", _sqliteConn);
+        deleteCmd.ExecuteNonQuery();
+
+        using var insertCmd = new SqliteCommand($"INSERT INTO schema_version (version) VALUES ({version})", _sqliteConn);
+        insertCmd.ExecuteNonQuery();
+    }
+
     private void MigrateSchema()
     {
         if (_sqliteConn == null) return;
 
-        // Pruefen welche Spalten existieren
-        var existingColumns = new HashSet<string>();
-        using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
-        using (var reader = cmd.ExecuteReader())
+        var currentVersion = GetSchemaVersion();
+
+        // Migration von Version 1 -> 2: error_category hinzufuegen
+        if (currentVersion < 2)
         {
-            while (reader.Read())
+            // Pruefen ob dns_events Tabelle existiert (koennte neue DB sein)
+            using var checkCmd = new SqliteCommand(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='dns_events'", _sqliteConn);
+            var tableExists = checkCmd.ExecuteScalar() != null;
+
+            if (tableExists)
             {
-                existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+                // Pruefen welche Spalten existieren
+                var existingColumns = new HashSet<string>();
+                using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+                    }
+                }
+
+                if (!existingColumns.Contains("error_category"))
+                {
+                    using var alterCmd = new SqliteCommand(
+                        "ALTER TABLE dns_events ADD COLUMN error_category TEXT", _sqliteConn);
+                    alterCmd.ExecuteNonQuery();
+
+                    using var indexCmd = new SqliteCommand(
+                        "CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category)", _sqliteConn);
+                    indexCmd.ExecuteNonQuery();
+
+                    if (Environment.UserInteractive && !_config.Quiet)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine("[SQLite] Schema migriert v1->v2: error_category Spalte hinzugefuegt");
+                        Console.ResetColor();
+                    }
+                    _logger.LogInformation("Schema migriert v1->v2: error_category Spalte hinzugefuegt");
+                }
             }
         }
 
-        // Migration: error_category hinzufuegen (v1.1)
-        if (!existingColumns.Contains("error_category"))
-        {
-            using var alterCmd = new SqliteCommand(
-                "ALTER TABLE dns_events ADD COLUMN error_category TEXT", _sqliteConn);
-            alterCmd.ExecuteNonQuery();
-
-            using var indexCmd = new SqliteCommand(
-                "CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category)", _sqliteConn);
-            indexCmd.ExecuteNonQuery();
-
-            if (Environment.UserInteractive && !_config.Quiet)
-            {
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.WriteLine("[SQLite] Schema migriert: error_category Spalte hinzugefuegt");
-                Console.ResetColor();
-            }
-            _logger.LogInformation("Schema migriert: error_category Spalte hinzugefuegt");
-        }
+        // Aktuelle Version setzen
+        SetSchemaVersion(CurrentSchemaVersion);
     }
 
     private void QueueEvent(DnsClientEvent evt)

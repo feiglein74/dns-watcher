@@ -142,6 +142,39 @@ LIMIT 20;
 - Windows 7+ / Windows Server 2008 R2+
 - Administrator-Rechte
 
+## Windows Service (Dauerbetrieb)
+
+Fuer den produktiven Einsatz wird der Betrieb als Windows-Dienst empfohlen.
+
+### Service installieren
+
+```powershell
+# Als Administrator ausfuehren!
+DnsClientWatcher.exe install --sqlite=C:\Logs\dns-client.db
+```
+
+### Service steuern
+
+```powershell
+DnsClientWatcher.exe start    # Service starten
+DnsClientWatcher.exe stop     # Service stoppen
+DnsClientWatcher.exe status   # Status anzeigen
+DnsClientWatcher.exe uninstall # Service deinstallieren
+```
+
+### Service-Log Format
+
+Im Service-Modus werden Statistik-Meldungen im .NET-Logging-Format ausgegeben:
+
+```
+info: DnsClientWatcher.DnsClientWatcherService[0]
+      Laeuft seit 04:35:00, 7,031 Events (0.4/s)
+```
+
+Das Format ist: `{LogLevel}: {CategoryName}[{EventId}]`
+- Die `[0]` ist die Event-ID (wir verwenden keine spezifischen IDs, daher immer 0)
+- Dies ist rein informativ und kann ignoriert werden
+
 ## Technische Details
 
 - ETW Provider: `Microsoft-Windows-DNS-Client` (`1C95126E-7EEA-49A9-A3FE-A378B03DDB4D`)

@@ -18,6 +18,42 @@ Die Datenbank kann waehrend des Betriebs gelesen werden (WAL-Modus). Beim Schrei
 
 ---
 
+## Schema-Versionierung
+
+Beide Datenbanken enthalten eine `schema_version` Tabelle zur Kompatibilitaetspruefung.
+
+**Tabelle**: `schema_version`
+
+| Spalte | Typ | Beschreibung |
+|--------|-----|--------------|
+| `version` | INTEGER | Aktuelle Schema-Version |
+
+### Versionshistorie
+
+| Version | Aenderungen |
+|---------|-------------|
+| 1 | Initiales Schema (ohne Versionstabelle) |
+| 2 | + `error_category` Spalte, + `schema_version` Tabelle |
+
+### Kompatibilitaetspruefung
+
+Viewer-Komponenten sollten die Schema-Version pruefen:
+
+```sql
+-- Version abfragen (falls Tabelle existiert)
+SELECT version FROM schema_version LIMIT 1;
+
+-- Pruefen ob Tabelle existiert (alte Datenbanken haben keine)
+SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
+```
+
+**Empfohlene Logik:**
+1. Wenn `schema_version` Tabelle nicht existiert → Version 1 annehmen
+2. Wenn Version < erwartete Version → Warnung ausgeben oder Feature deaktivieren
+3. Wenn Version > erwartete Version → Viewer ist veraltet, Update empfehlen
+
+---
+
 ## DnsServerWatcher - Schema
 
 **Tabelle**: `dns_events`
@@ -241,8 +277,21 @@ Install-Module -Name PSSQLite -Scope CurrentUser
 # Modul laden
 Import-Module PSSQLite
 
-# Abfrage ausfuehren
 $dbPath = "C:\Logs\dns-events.db"
+
+# Schema-Version pruefen
+$minVersion = 2  # Erwartete Mindestversion
+$versionTable = Invoke-SqliteQuery -DataSource $dbPath -Query @"
+SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'
+"@
+if ($versionTable) {
+    $version = (Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT version FROM schema_version LIMIT 1").version
+} else {
+    $version = 1  # Alte DB ohne Versionstabelle
+}
+if ($version -lt $minVersion) {
+    Write-Warning "Datenbank-Schema Version $version ist aelter als erwartet ($minVersion)"
+}
 
 # IP suchen
 $events = Invoke-SqliteQuery -DataSource $dbPath -Query @"
@@ -277,7 +326,6 @@ import (
     "database/sql"
     "fmt"
     "log"
-    "time"
 
     _ "github.com/mattn/go-sqlite3"
 )
@@ -294,6 +342,21 @@ type DnsEvent struct {
     ErrorCategory sql.NullString
 }
 
+// GetSchemaVersion prueft die Schema-Version der Datenbank
+func GetSchemaVersion(db *sql.DB) int {
+    var name string
+    err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'").Scan(&name)
+    if err != nil {
+        return 1 // Alte DB ohne Versionstabelle
+    }
+    var version int
+    err = db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version)
+    if err != nil {
+        return 1
+    }
+    return version
+}
+
 func main() {
     // Datenbank oeffnen (read-only empfohlen)
     db, err := sql.Open("sqlite3", "file:C:/Logs/dns-events.db?mode=ro")
@@ -301,6 +364,13 @@ func main() {
         log.Fatal(err)
     }
     defer db.Close()
+
+    // Schema-Version pruefen
+    minVersion := 2
+    version := GetSchemaVersion(db)
+    if version < minVersion {
+        log.Printf("Warnung: Schema Version %d ist aelter als erwartet (%d)", version, minVersion)
+    }
 
     // IP suchen
     rows, err := db.Query(`
@@ -336,10 +406,26 @@ func main() {
 import sqlite3
 from datetime import datetime, timedelta
 
+def get_schema_version(conn):
+    """Prueft die Schema-Version der Datenbank"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
+    if cursor.fetchone() is None:
+        return 1  # Alte DB ohne Versionstabelle
+    cursor.execute("SELECT version FROM schema_version LIMIT 1")
+    row = cursor.fetchone()
+    return row[0] if row else 1
+
 # Datenbank oeffnen
 conn = sqlite3.connect("file:C:/Logs/dns-events.db?mode=ro", uri=True)
 conn.row_factory = sqlite3.Row
 cursor = conn.cursor()
+
+# Schema-Version pruefen
+MIN_VERSION = 2
+version = get_schema_version(conn)
+if version < MIN_VERSION:
+    print(f"Warnung: Schema Version {version} ist aelter als erwartet ({MIN_VERSION})")
 
 # IP suchen
 cursor.execute("""
