@@ -34,6 +34,8 @@ Beide Datenbanken enthalten eine `schema_version` Tabelle zur Kompatibilitaetspr
 |---------|-------------|
 | 1 | Initiales Schema (ohne Versionstabelle) |
 | 2 | + `error_category` Spalte, + `schema_version` Tabelle |
+| 3 | + `raw_payload` Spalte (nur bei unbekannten Events befuellt) |
+| 4 | + `event_id` Spalte (DnsServerWatcher - Original ETW Event-ID) |
 
 ### Kompatibilitaetspruefung
 
@@ -64,6 +66,7 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 |--------|-----|--------------|
 | `id` | INTEGER | Primary Key, Auto-Increment |
 | `timestamp` | TEXT | ISO 8601 Zeitstempel |
+| `event_id` | INTEGER | Original ETW Event-ID (256, 257, 519, etc.) |
 | `event_type` | TEXT | Event-Typ: `QUERY`, `RESPONSE`, `TIMEOUT`, `FAILURE` |
 | `client_ip` | TEXT | IP-Adresse des anfragenden Clients |
 | `query_name` | TEXT | Angefragter DNS-Name (ohne trailing dot) |
@@ -72,10 +75,12 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 | `resolved_ips` | TEXT | Aufgeloeste Adressen (komma-separiert) oder Parse-Fehler |
 | `zone` | TEXT | DNS-Zone (falls verfuegbar) |
 | `error_category` | TEXT | Fehler-Kategorie: `CONFIG_ERROR`, `CLIENT_ERROR`, oder NULL |
+| `raw_payload` | TEXT | JSON mit ETW-Payload (nur bei unbekannten Events, sonst NULL) |
 
 ### Indices
 
 - `idx_timestamp` - Schnelle zeitbasierte Abfragen
+- `idx_event_id` - Filterung nach ETW Event-ID
 - `idx_client_ip` - Suche nach Client-IP
 - `idx_query_name` - Suche nach Domain-Namen
 - `idx_resolved_ips` - Suche nach aufgeloesten IPs
@@ -83,12 +88,22 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 
 ### Event-Typen
 
+Bekannte Event-Typen werden mit Namen angezeigt. Unbekannte Events erscheinen als `EVENT_XXX`.
+
 | Event-Type | ETW Event-ID | Beschreibung |
 |------------|--------------|--------------|
 | `QUERY` | 256 | DNS-Anfrage empfangen |
 | `RESPONSE` | 257 | DNS-Antwort gesendet |
-| `TIMEOUT` | 260 | Anfrage Timeout |
+| `RECURSE_OUT` | 258 | Rekursive Anfrage an Upstream gesendet |
+| `RECURSE_IN` | 259 | Rekursive Antwort von Upstream |
+| `TIMEOUT` | 260 | Anfrage Timeout (oder parallele Anfrage abgebrochen) |
 | `RECURSE` | 261 | Antwort von Upstream-Server (rekursive Aufloesung) |
+| `DYN_UPDATE` | 263 | Dynamic DNS Update empfangen |
+| `DYN_UPDATE_RESP` | 264 | Dynamic DNS Update Antwort |
+| `CNAME_LOOKUP` | 279 | Interner CNAME-Lookup (Aufloesung eines CNAME-Ziels) |
+| `LOOKUP` | 280 | DNS-Lookup Event |
+| `DYN_UPDATE_REC` | 519, 520 | Dynamic DNS Update Audit-Record |
+| `EVENT_XXX` | andere | Alle anderen Events (Zone Transfers, etc.) |
 
 ### Response Codes
 
@@ -132,6 +147,7 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 | `dns_server` | TEXT | Verwendeter DNS-Server |
 | `interface_index` | INTEGER | Netzwerk-Interface Index |
 | `error_category` | TEXT | Fehler-Kategorie: `CONFIG_ERROR`, `CLIENT_ERROR`, oder NULL |
+| `raw_payload` | TEXT | JSON mit ETW-Payload (nur bei unbekannten Events, sonst NULL) |
 
 ### Indices
 
@@ -145,11 +161,18 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 
 | Event-Type | ETW Event-ID | Beschreibung |
 |------------|--------------|--------------|
+| `SERVER_LIST` | 1001 | DNS-Server Konfiguration (Interface, Server-IP) |
+| `SERVER_TIMEOUT` | 1015 | DNS-Server antwortet nicht (Timeout) |
+| `NAME_ERROR` | 1016 | DNS-Namensaufloesung fehlgeschlagen (NXDomain) |
 | `QUERY` | 3006 | DNS-Anfrage gestartet |
 | `COMPLETE` | 3008 | Anfrage abgeschlossen |
-| `SEND` | 3009 | Anfrage an Server gesendet |
-| `CACHE` | 3018 | Antwort aus Cache |
-| `RESPONSE` | 3020 | Antwort empfangen |
+| `SEND` | 3009 | Netzwerk-Anfrage initiiert |
+| `SEND_TO` | 3010 | Query an spezifischen Server gesendet |
+| `RECV` | 3011 | Antwort vom Server empfangen |
+| `CACHE_LOOKUP` | 3016 | Cache-Abfrage gestartet |
+| `CACHE` | 3018 | Cache-Abfrage Ergebnis |
+| `WIRE_QUERY` | 3019 | Query auf Netzwerk gesendet |
+| `RESPONSE` | 3020 | Query-Antwort Ergebnis |
 
 ### Status Codes
 

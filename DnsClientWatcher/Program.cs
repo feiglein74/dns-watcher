@@ -726,7 +726,8 @@ public class DnsClientWatcherService : BackgroundService
                 query_results TEXT,
                 dns_server TEXT,
                 interface_index INTEGER,
-                error_category TEXT
+                error_category TEXT,
+                raw_payload TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_process_name ON dns_events(process_name);
@@ -740,9 +741,9 @@ public class DnsClientWatcherService : BackgroundService
 
         _insertCmd = new SqliteCommand(@"
             INSERT INTO dns_events
-            (timestamp, event_type, event_id, process_id, process_name, query_name, query_type, status, query_results, dns_server, interface_index, error_category)
+            (timestamp, event_type, event_id, process_id, process_name, query_name, query_type, status, query_results, dns_server, interface_index, error_category, raw_payload)
             VALUES
-            (@timestamp, @event_type, @event_id, @process_id, @process_name, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index, @error_category)
+            (@timestamp, @event_type, @event_id, @process_id, @process_name, @query_name, @query_type, @status, @query_results, @dns_server, @interface_index, @error_category, @raw_payload)
         ", _sqliteConn);
         _insertCmd.Parameters.Add("@timestamp", SqliteType.Text);
         _insertCmd.Parameters.Add("@event_type", SqliteType.Text);
@@ -756,6 +757,7 @@ public class DnsClientWatcherService : BackgroundService
         _insertCmd.Parameters.Add("@dns_server", SqliteType.Text);
         _insertCmd.Parameters.Add("@interface_index", SqliteType.Integer);
         _insertCmd.Parameters.Add("@error_category", SqliteType.Text);
+        _insertCmd.Parameters.Add("@raw_payload", SqliteType.Text);
         _insertCmd.Prepare();
 
         _flushTimer = new Timer(_ => FlushEventQueue(), null, FlushIntervalSec * 1000, FlushIntervalSec * 1000);
@@ -892,7 +894,7 @@ public class DnsClientWatcherService : BackgroundService
         }
     }
 
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
 
     private int GetSchemaVersion()
     {
@@ -973,6 +975,42 @@ public class DnsClientWatcherService : BackgroundService
             }
         }
 
+        // Migration von Version 2 -> 3: raw_payload hinzufuegen
+        if (currentVersion < 3)
+        {
+            using var checkCmd = new SqliteCommand(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='dns_events'", _sqliteConn);
+            var tableExists = checkCmd.ExecuteScalar() != null;
+
+            if (tableExists)
+            {
+                var existingColumns = new HashSet<string>();
+                using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+                    }
+                }
+
+                if (!existingColumns.Contains("raw_payload"))
+                {
+                    using var alterCmd = new SqliteCommand(
+                        "ALTER TABLE dns_events ADD COLUMN raw_payload TEXT", _sqliteConn);
+                    alterCmd.ExecuteNonQuery();
+
+                    if (Environment.UserInteractive && !_config.Quiet)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine("[SQLite] Schema migriert v2->v3: raw_payload Spalte hinzugefuegt");
+                        Console.ResetColor();
+                    }
+                    _logger.LogInformation("Schema migriert v2->v3: raw_payload Spalte hinzugefuegt");
+                }
+            }
+        }
+
         // Aktuelle Version setzen
         SetSchemaVersion(CurrentSchemaVersion);
     }
@@ -1020,6 +1058,7 @@ public class DnsClientWatcherService : BackgroundService
                 _insertCmd.Parameters["@dns_server"].Value = evt.DnsServer ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@interface_index"].Value = evt.InterfaceIndex ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@error_category"].Value = evt.ErrorCategory ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@raw_payload"].Value = evt.RawPayload ?? (object)DBNull.Value;
                 _insertCmd.ExecuteNonQuery();
             }
 
@@ -1085,13 +1124,56 @@ public class DnsClientWatcherService : BackgroundService
 
     private static string GetEventName(int eventId) => eventId switch
     {
+        1001 => "SERVER_LIST",
+        1015 => "SERVER_TIMEOUT",
+        1016 => "NAME_ERROR",
         3006 => "QUERY",
         3008 => "COMPLETE",
         3009 => "SEND",
+        3010 => "SEND_TO",
+        3011 => "RECV",
+        3016 => "CACHE_LOOKUP",
         3018 => "CACHE",
+        3019 => "WIRE_QUERY",
         3020 => "RESPONSE",
         _ => $"EVENT_{eventId}"
     };
+
+    // Dekodiert SOCKADDR_IN Struktur aus Base64 zu IP-Adresse
+    private static string? DecodeSockAddr(object? addressObj)
+    {
+        if (addressObj == null) return null;
+        try
+        {
+            byte[] bytes;
+            if (addressObj is byte[] byteArray)
+                bytes = byteArray;
+            else if (addressObj is string base64)
+                bytes = Convert.FromBase64String(base64);
+            else
+                return null;
+
+            if (bytes.Length < 8) return null;
+
+            // AF_INET = 2 (IPv4)
+            var family = BitConverter.ToUInt16(bytes, 0);
+            if (family == 2 && bytes.Length >= 8)
+            {
+                // IPv4: Bytes 4-7 sind die IP-Adresse
+                return $"{bytes[4]}.{bytes[5]}.{bytes[6]}.{bytes[7]}";
+            }
+            // AF_INET6 = 23 (IPv6)
+            else if (family == 23 && bytes.Length >= 24)
+            {
+                // IPv6: Bytes 8-23 sind die IP-Adresse
+                var ipv6Bytes = new byte[16];
+                Array.Copy(bytes, 8, ipv6Bytes, 0, 16);
+                return new System.Net.IPAddress(ipv6Bytes).ToString();
+            }
+            return null;
+        }
+        catch { return null; }
+    }
 
     private void ProcessEvent(TraceEvent evt)
     {
@@ -1108,28 +1190,102 @@ public class DnsClientWatcherService : BackgroundService
 
         try
         {
-            queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
-
-            var qtypeVal = evt.PayloadByName("QueryType");
-            if (qtypeVal != null && int.TryParse(qtypeVal.ToString()?.Trim(), out int qt))
+            // Event 1001: SERVER_LIST - DNS Server Konfiguration
+            if (eventId == 1001)
             {
-                qtypeNum = qt;
-                qtype = QueryTypes.TryGetValue(qt, out var qtName) ? qtName : qt.ToString();
-            }
+                var iface = evt.PayloadByName("Interface")?.ToString();
+                var address = evt.PayloadByName("Address");
+                var serverIp = DecodeSockAddr(address);
+                var totalCount = evt.PayloadByName("TotalServerCount")?.ToString();
+                var index = evt.PayloadByName("Index")?.ToString();
+                var dynamic = evt.PayloadByName("DynamicAddress");
+                var isDynamic = dynamic?.ToString() == "1";
 
-            var statusVal = evt.PayloadByName("Status") ?? evt.PayloadByName("QueryStatus");
-            if (statusVal != null && int.TryParse(statusVal.ToString()?.Trim(), out int st))
+                // Interface als queryName, Server-IP als queryResults
+                queryName = iface;
+                queryResults = serverIp;
+                dnsServer = serverIp;
+                // Format: "Server 1/2 (DHCP)" oder "Server 1/2 (static)"
+                status = $"Server {index}/{totalCount} ({(isDynamic ? "DHCP" : "static")})";
+            }
+            // Event 1015: SERVER_TIMEOUT - DNS-Server antwortet nicht
+            else if (eventId == 1015)
             {
-                statusNum = st;
-                status = StatusCodes.TryGetValue(st, out var stName) ? stName : st.ToString();
+                queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
+                var address = evt.PayloadByName("Address");
+                var serverIp = DecodeSockAddr(address);
+                dnsServer = serverIp;
+                status = "Timeout";
+                statusNum = 1460; // Windows Timeout-Code
             }
+            // Event 1016: NAME_ERROR - DNS-Namensaufloesung fehlgeschlagen (z.B. NXDomain)
+            else if (eventId == 1016)
+            {
+                queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
+                var address = evt.PayloadByName("Address");
+                var serverIp = DecodeSockAddr(address);
+                dnsServer = serverIp;
+                status = "NXDomain";
+                statusNum = 9003; // Windows NXDomain-Code
+            }
+            // Event 3010: SEND_TO - Query an spezifischen Server gesendet
+            else if (eventId == 3010)
+            {
+                queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
+                dnsServer = evt.PayloadByName("DnsServerIpAddress")?.ToString();
 
-            queryResults = evt.PayloadByName("QueryResults")?.ToString();
-            dnsServer = evt.PayloadByName("DNSServerAddress")?.ToString();
+                var qtypeVal = evt.PayloadByName("QueryType");
+                if (qtypeVal != null && int.TryParse(qtypeVal.ToString()?.Trim(), out int qt))
+                {
+                    qtypeNum = qt;
+                    qtype = QueryTypes.TryGetValue(qt, out var qtName) ? qtName : qt.ToString();
+                }
+            }
+            // Event 3011: RESPONSE_EX - Extended Response mit Status
+            else if (eventId == 3011)
+            {
+                queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
+                dnsServer = evt.PayloadByName("DnsServerIpAddress")?.ToString();
 
-            var ifIdxVal = evt.PayloadByName("InterfaceIndex");
-            if (ifIdxVal != null && int.TryParse(ifIdxVal.ToString()?.Trim(), out int idx))
-                interfaceIndex = idx;
+                var qtypeVal = evt.PayloadByName("QueryType");
+                if (qtypeVal != null && int.TryParse(qtypeVal.ToString()?.Trim(), out int qt))
+                {
+                    qtypeNum = qt;
+                    qtype = QueryTypes.TryGetValue(qt, out var qtName) ? qtName : qt.ToString();
+                }
+
+                var statusVal = evt.PayloadByName("ResponseStatus");
+                if (statusVal != null && int.TryParse(statusVal.ToString()?.Trim(), out int st))
+                {
+                    statusNum = st;
+                    status = StatusCodes.TryGetValue(st, out var stName) ? stName : st.ToString();
+                }
+            }
+            else
+            {
+                queryName = evt.PayloadByName("QueryName")?.ToString()?.TrimEnd('.');
+
+                var qtypeVal = evt.PayloadByName("QueryType");
+                if (qtypeVal != null && int.TryParse(qtypeVal.ToString()?.Trim(), out int qt))
+                {
+                    qtypeNum = qt;
+                    qtype = QueryTypes.TryGetValue(qt, out var qtName) ? qtName : qt.ToString();
+                }
+
+                var statusVal = evt.PayloadByName("Status") ?? evt.PayloadByName("QueryStatus");
+                if (statusVal != null && int.TryParse(statusVal.ToString()?.Trim(), out int st))
+                {
+                    statusNum = st;
+                    status = StatusCodes.TryGetValue(st, out var stName) ? stName : st.ToString();
+                }
+
+                queryResults = evt.PayloadByName("QueryResults")?.ToString();
+                dnsServer = evt.PayloadByName("DNSServerAddress")?.ToString();
+
+                var ifIdxVal = evt.PayloadByName("InterfaceIndex");
+                if (ifIdxVal != null && int.TryParse(ifIdxVal.ToString()?.Trim(), out int idx))
+                    interfaceIndex = idx;
+            }
         }
         catch { }
 
@@ -1170,13 +1326,24 @@ public class DnsClientWatcherService : BackgroundService
             _logWriter.WriteLine(line);
         }
 
-        // SQLite speichern
-        if (_sqliteConn != null && (eventId == 3006 || eventId == 3008 || eventId == 3018 || eventId == 3020))
+        // SQLite speichern (alle Events)
+        if (_sqliteConn != null)
         {
+            // raw_payload nur bei unbekannten Events speichern
+            string? rawPayload = null;
+            var isKnownEvent = eventId == 1001 || eventId == 1015 || eventId == 1016 || eventId == 3006 || eventId == 3008 || eventId == 3009 || eventId == 3010 || eventId == 3011 || eventId == 3016 || eventId == 3018 || eventId == 3019 || eventId == 3020;
+            if (!isKnownEvent)
+            {
+                var payloadDict = new Dictionary<string, object?>();
+                for (int i = 0; i < evt.PayloadNames.Length; i++)
+                    payloadDict[evt.PayloadNames[i]] = evt.PayloadValue(i);
+                rawPayload = System.Text.Json.JsonSerializer.Serialize(payloadDict);
+            }
+
             var dnsEvent = new DnsClientEvent(
                 evt.TimeStamp, GetEventName(eventId), eventId, processId, processName,
                 queryName, qtype, status, FormatQueryResults(queryResults), dnsServer,
-                interfaceIndex > 0 ? interfaceIndex : null, errorCategory);
+                interfaceIndex > 0 ? interfaceIndex : null, errorCategory, rawPayload);
             QueueEvent(dnsEvent);
             Interlocked.Increment(ref _eventCount);
             CheckPeriodicCleanup();
@@ -1186,17 +1353,119 @@ public class DnsClientWatcherService : BackgroundService
         if (_config.Quiet || !Environment.UserInteractive)
             return;
 
-        if (eventId != 3006 && eventId != 3008 && eventId != 3009 && eventId != 3018 && eventId != 3020 && !_config.ShowRaw)
-            return;
-
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.Write($"[{timestamp}] ");
 
         switch (eventId)
         {
+            case 1001:
+                // SERVER_LIST: DNS Server Konfiguration
+                Console.ForegroundColor = ConsoleColor.Magenta;
+                Console.Write("SERVER_LIST ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");  // Interface
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" -> ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(queryResults ?? "?");  // Server IP
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"({status})");
+                break;
+
+            case 1015:
+                // SERVER_TIMEOUT: DNS-Server antwortet nicht
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Write("SERVER_TIMEOUT ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" <- ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(dnsServer ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
+                break;
+
+            case 1016:
+                // NAME_ERROR: DNS-Namensaufloesung fehlgeschlagen (NXDomain)
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Write("NAME_ERROR ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" <- ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(dnsServer ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
+                break;
+
             case 3006:
                 Console.ForegroundColor = ConsoleColor.White;
                 Console.Write("QUERY    ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"[{qtype ?? "?"}]");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
+                break;
+
+            case 3010:
+                // SEND_TO: Query an spezifischen Server gesendet
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write("SEND_TO  ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"[{qtype ?? "?"}]");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" -> ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(dnsServer ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
+                break;
+
+            case 3011:
+                // RECV: Antwort vom DNS-Server empfangen
+                var recvColor = statusNum == 0 ? ConsoleColor.Green :
+                    (errorCategory == "CLIENT_ERROR" ? ConsoleColor.DarkYellow : ConsoleColor.Red);
+                Console.ForegroundColor = recvColor;
+                Console.Write("RECV     ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"[{qtype ?? "?"}] ");
+                Console.ForegroundColor = GetStatusColor(statusNum);
+                Console.Write(status ?? "?");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write(" <- ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine(dnsServer ?? "?");
+                break;
+
+            case 3016:
+                // CACHE_LOOKUP: Cache-Abfrage gestartet
+                Console.ForegroundColor = ConsoleColor.DarkCyan;
+                Console.Write("CACHE_LOOKUP ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                Console.Write(" ");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write($"[{qtype ?? "?"}]");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
+                break;
+
+            case 3019:
+                // WIRE_QUERY: Query auf Netzwerk gesendet
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write("WIRE_QUERY ");
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.Write(queryName ?? "?");
                 Console.Write(" ");
@@ -1293,11 +1562,25 @@ public class DnsClientWatcherService : BackgroundService
                 break;
 
             default:
-                if (_config.ShowRaw)
+                // Alle anderen Events
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.Write($"EVENT_{eventId,-3} ");
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write(queryName ?? "?");
+                if (!string.IsNullOrEmpty(qtype))
                 {
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    Console.WriteLine($"EVENT_{eventId} {queryName ?? "?"}");
+                    Console.Write(" ");
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.Write($"[{qtype}]");
                 }
+                if (!string.IsNullOrEmpty(status))
+                {
+                    Console.Write(" ");
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write(status);
+                }
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($" ({processName})");
                 break;
         }
 
@@ -1326,5 +1609,6 @@ public record DnsClientEvent(
     string? QueryResults,
     string? DnsServer,
     int? InterfaceIndex,
-    string? ErrorCategory = null
+    string? ErrorCategory = null,
+    string? RawPayload = null
 );

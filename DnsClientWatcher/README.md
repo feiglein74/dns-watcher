@@ -104,11 +104,18 @@ LIMIT 20;
 
 | Event-ID | Name | Beschreibung |
 |----------|------|--------------|
+| 1001 | SERVER_LIST | DNS-Server Konfiguration pro Interface |
+| 1015 | SERVER_TIMEOUT | DNS-Server antwortet nicht (Timeout) |
+| 1016 | NAME_ERROR | DNS-Namensaufloesung fehlgeschlagen (NXDomain) |
 | 3006 | QUERY | DNS-Anfrage gestartet |
 | 3008 | COMPLETE | DNS-Anfrage abgeschlossen |
-| 3009 | SEND | Anfrage an DNS-Server gesendet |
-| 3018 | CACHE | Cache-Hit (aus lokalem Cache) |
-| 3020 | RESPONSE | Antwort vom DNS-Server erhalten |
+| 3009 | SEND | Netzwerk-Anfrage initiiert |
+| 3010 | SEND_TO | Query an spezifischen Server gesendet |
+| 3011 | RECV | Antwort vom Server empfangen |
+| 3016 | CACHE_LOOKUP | Cache-Abfrage gestartet |
+| 3018 | CACHE | Cache-Abfrage Ergebnis |
+| 3019 | WIRE_QUERY | Query auf Netzwerk gesendet |
+| 3020 | RESPONSE | Query-Antwort Ergebnis |
 
 ## Ausgabe-Format
 
