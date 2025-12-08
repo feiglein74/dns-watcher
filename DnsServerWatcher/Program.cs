@@ -654,7 +654,10 @@ public class DnsServerWatcherService : BackgroundService
                 resolved_ips TEXT,
                 zone TEXT,
                 error_category TEXT,
-                raw_payload TEXT
+                raw_payload TEXT,
+                correlation_id TEXT,
+                xid INTEGER,
+                qxid INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_timestamp ON dns_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_event_id ON dns_events(event_id);
@@ -662,6 +665,7 @@ public class DnsServerWatcherService : BackgroundService
             CREATE INDEX IF NOT EXISTS idx_query_name ON dns_events(query_name);
             CREATE INDEX IF NOT EXISTS idx_resolved_ips ON dns_events(resolved_ips);
             CREATE INDEX IF NOT EXISTS idx_error_category ON dns_events(error_category);
+            CREATE INDEX IF NOT EXISTS idx_correlation_id ON dns_events(correlation_id);
         ";
 
         using var cmd = new SqliteCommand(createTable, _sqliteConn);
@@ -669,9 +673,9 @@ public class DnsServerWatcherService : BackgroundService
 
         _insertCmd = new SqliteCommand(@"
             INSERT INTO dns_events
-            (timestamp, event_id, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone, error_category, raw_payload)
+            (timestamp, event_id, event_type, client_ip, query_name, query_type, response_code, resolved_ips, zone, error_category, raw_payload, correlation_id, xid, qxid)
             VALUES
-            (@timestamp, @event_id, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone, @error_category, @raw_payload)
+            (@timestamp, @event_id, @event_type, @client_ip, @query_name, @query_type, @response_code, @resolved_ips, @zone, @error_category, @raw_payload, @correlation_id, @xid, @qxid)
         ", _sqliteConn);
         _insertCmd.Parameters.Add("@timestamp", SqliteType.Text);
         _insertCmd.Parameters.Add("@event_id", SqliteType.Integer);
@@ -684,6 +688,9 @@ public class DnsServerWatcherService : BackgroundService
         _insertCmd.Parameters.Add("@zone", SqliteType.Text);
         _insertCmd.Parameters.Add("@error_category", SqliteType.Text);
         _insertCmd.Parameters.Add("@raw_payload", SqliteType.Text);
+        _insertCmd.Parameters.Add("@correlation_id", SqliteType.Text);
+        _insertCmd.Parameters.Add("@xid", SqliteType.Integer);
+        _insertCmd.Parameters.Add("@qxid", SqliteType.Integer);
         _insertCmd.Prepare();
 
         _flushTimer = new Timer(_ => FlushEventQueue(), null, FlushIntervalSec * 1000, FlushIntervalSec * 1000);
@@ -820,7 +827,7 @@ public class DnsServerWatcherService : BackgroundService
         }
     }
 
-    private const int CurrentSchemaVersion = 4;
+    private const int CurrentSchemaVersion = 5;
 
     private int GetSchemaVersion()
     {
@@ -977,6 +984,63 @@ public class DnsServerWatcherService : BackgroundService
             }
         }
 
+        // Migration von Version 4 -> 5: correlation_id, xid, qxid hinzufuegen
+        if (currentVersion < 5)
+        {
+            using var checkCmd = new SqliteCommand(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='dns_events'", _sqliteConn);
+            var tableExists = checkCmd.ExecuteScalar() != null;
+
+            if (tableExists)
+            {
+                var existingColumns = new HashSet<string>();
+                using (var cmd = new SqliteCommand("PRAGMA table_info(dns_events)", _sqliteConn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        existingColumns.Add(reader.GetString(1).ToLowerInvariant());
+                    }
+                }
+
+                if (!existingColumns.Contains("correlation_id"))
+                {
+                    using var alterCmd = new SqliteCommand(
+                        "ALTER TABLE dns_events ADD COLUMN correlation_id TEXT", _sqliteConn);
+                    alterCmd.ExecuteNonQuery();
+
+                    using var indexCmd = new SqliteCommand(
+                        "CREATE INDEX IF NOT EXISTS idx_correlation_id ON dns_events(correlation_id)", _sqliteConn);
+                    indexCmd.ExecuteNonQuery();
+                }
+
+                if (!existingColumns.Contains("xid"))
+                {
+                    using var alterCmd = new SqliteCommand(
+                        "ALTER TABLE dns_events ADD COLUMN xid INTEGER", _sqliteConn);
+                    alterCmd.ExecuteNonQuery();
+                }
+
+                if (!existingColumns.Contains("qxid"))
+                {
+                    using var alterCmd = new SqliteCommand(
+                        "ALTER TABLE dns_events ADD COLUMN qxid INTEGER", _sqliteConn);
+                    alterCmd.ExecuteNonQuery();
+                }
+
+                if (!existingColumns.Contains("correlation_id") || !existingColumns.Contains("xid") || !existingColumns.Contains("qxid"))
+                {
+                    if (Environment.UserInteractive && !_config.Quiet)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine("[SQLite] Schema migriert v4->v5: correlation_id/xid/qxid Spalten hinzugefuegt");
+                        Console.ResetColor();
+                    }
+                    _logger.LogInformation("Schema migriert v4->v5: correlation_id/xid/qxid Spalten hinzugefuegt");
+                }
+            }
+        }
+
         // Aktuelle Version setzen
         SetSchemaVersion(CurrentSchemaVersion);
     }
@@ -1023,6 +1087,9 @@ public class DnsServerWatcherService : BackgroundService
                 _insertCmd.Parameters["@zone"].Value = evt.Zone ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@error_category"].Value = evt.ErrorCategory ?? (object)DBNull.Value;
                 _insertCmd.Parameters["@raw_payload"].Value = evt.RawPayload ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@correlation_id"].Value = evt.CorrelationId ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@xid"].Value = evt.Xid ?? (object)DBNull.Value;
+                _insertCmd.Parameters["@qxid"].Value = evt.Qxid ?? (object)DBNull.Value;
                 _insertCmd.ExecuteNonQuery();
             }
 
@@ -1102,6 +1169,7 @@ public class DnsServerWatcherService : BackgroundService
         259 => "RECURSE_RESPONSE_IN",
         260 => "QUERY_TIMEOUT",
         261 => "RESPONSE_FAILURE",
+        262 => "RECURSE_TIMEOUT",
         263 => "DYN_UPDATE",
         264 => "DYN_UPDATE_RESP",
         519 => "DYN_UPDATE_REC",
@@ -1124,6 +1192,8 @@ public class DnsServerWatcherService : BackgroundService
 
         string? qname = null, source = null, dest = null, qtype = null, rcode = null, zone = null;
         string? parseError = null;
+        string? correlationId = null;
+        int? xid = null, qxid = null;
         byte[]? packetData = null;
         List<string> resolvedIps = new();
 
@@ -1142,6 +1212,15 @@ public class DnsServerWatcherService : BackgroundService
                 rcode = ResponseCodes.TryGetValue(rc, out var rcName) ? rcName : rc.ToString();
 
             zone = evt.PayloadByName("Zone")?.ToString();
+
+            // Korrelations-Felder extrahieren
+            correlationId = evt.PayloadByName("GUID")?.ToString();
+            var xidVal = evt.PayloadByName("XID");
+            if (xidVal != null && int.TryParse(xidVal.ToString()?.Trim(), out int x))
+                xid = x;
+            var qxidVal = evt.PayloadByName("QXID");
+            if (qxidVal != null && int.TryParse(qxidVal.ToString()?.Trim(), out int qx))
+                qxid = qx;
 
             packetData = evt.PayloadByName("PacketData") as byte[];
             if (packetData != null && (eventId == 257 || eventId == 261))
@@ -1178,7 +1257,10 @@ public class DnsServerWatcherService : BackgroundService
                 resolvedAddresses = resolvedIps.Count > 0 ? resolvedIps : null,
                 zone,
                 parseError,
-                errorCategory
+                errorCategory,
+                correlationId,
+                xid,
+                qxid
             });
             Console.WriteLine(json);
             _logWriter?.WriteLine(json);
@@ -1194,6 +1276,7 @@ public class DnsServerWatcherService : BackgroundService
             259 => "RECURSE_IN",
             260 => "TIMEOUT",
             261 => "RECURSE",
+            262 => "RECURSE_TIMEOUT",
             263 => "DYN_UPDATE",
             264 => "DYN_UPDATE_RESP",
             279 => "CNAME_LOOKUP",
@@ -1224,7 +1307,7 @@ public class DnsServerWatcherService : BackgroundService
             string? rawPayload = null;
             var isKnownEvent = eventId == 256 || eventId == 257 || eventId == 258 ||
                                eventId == 259 || eventId == 260 || eventId == 261 ||
-                               eventId == 263 || eventId == 264 || eventId == 279 ||
+                               eventId == 262 || eventId == 263 || eventId == 264 || eventId == 279 ||
                                eventId == 280 || eventId == 519 || eventId == 520 ||
                                eventId == 536 || eventId == 541;
             var isConfigEvent = eventId >= 65000 && eventId <= 65535;
@@ -1249,7 +1332,7 @@ public class DnsServerWatcherService : BackgroundService
 
             var dnsEvent = new DnsServerEvent(
                 evt.TimeStamp, eventId, eventType, clientIp, qname, qtype, rcode,
-                resolvedInfo, zone, errorCategory, rawPayload);
+                resolvedInfo, zone, errorCategory, rawPayload, correlationId, xid, qxid);
             QueueEvent(dnsEvent);
             Interlocked.Increment(ref _eventCount);
             CheckPeriodicCleanup();
@@ -1392,6 +1475,7 @@ public class DnsServerWatcherService : BackgroundService
         if (_config.ShowRaw)
         {
             Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"    [PayloadNames: {string.Join(", ", evt.PayloadNames)}]");
             for (int i = 0; i < evt.PayloadNames.Length; i++)
                 Console.WriteLine($"    {evt.PayloadNames[i]} = {evt.PayloadValue(i)}");
             Console.ResetColor();
@@ -1411,5 +1495,8 @@ public record DnsServerEvent(
     string? ResolvedIps,
     string? Zone,
     string? ErrorCategory = null,
-    string? RawPayload = null
+    string? RawPayload = null,
+    string? CorrelationId = null,
+    int? Xid = null,
+    int? Qxid = null
 );

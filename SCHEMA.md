@@ -35,7 +35,8 @@ Beide Datenbanken enthalten eine `schema_version` Tabelle zur Kompatibilitaetspr
 | 1 | Initiales Schema (ohne Versionstabelle) |
 | 2 | + `error_category` Spalte, + `schema_version` Tabelle |
 | 3 | + `raw_payload` Spalte (nur bei unbekannten Events befuellt) |
-| 4 | + `event_id` Spalte (DnsServerWatcher - Original ETW Event-ID) |
+| 4 | DnsServerWatcher: + `event_id` Spalte; DnsClientWatcher: + `correlation_id`, `parent_correlation_id` Spalten |
+| 5 | DnsServerWatcher: + `correlation_id` (GUID), `xid`, `qxid` Spalten |
 
 ### Kompatibilitaetspruefung
 
@@ -76,6 +77,9 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 | `zone` | TEXT | DNS-Zone (falls verfuegbar) |
 | `error_category` | TEXT | Fehler-Kategorie: `CONFIG_ERROR`, `CLIENT_ERROR`, oder NULL |
 | `raw_payload` | TEXT | JSON mit ETW-Payload (nur bei unbekannten Events, sonst NULL) |
+| `correlation_id` | TEXT | Query-Korrelations-ID (GUID) - verknuepft alle Events einer Anfrage |
+| `xid` | INTEGER | DNS Transaction ID des aktuellen Pakets |
+| `qxid` | INTEGER | Original Query Transaction ID (bei Rekursion) |
 
 ### Indices
 
@@ -85,6 +89,7 @@ SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';
 - `idx_query_name` - Suche nach Domain-Namen
 - `idx_resolved_ips` - Suche nach aufgeloesten IPs
 - `idx_error_category` - Filterung nach Fehlertyp
+- `idx_correlation_id` - Gruppierung zusammengehoeriger Events
 
 ### Event-Typen
 
@@ -98,6 +103,7 @@ Bekannte Event-Typen werden mit Namen angezeigt. Unbekannte Events erscheinen al
 | `RECURSE_IN` | 259 | Rekursive Antwort von Upstream |
 | `TIMEOUT` | 260 | Anfrage Timeout (oder parallele Anfrage abgebrochen) |
 | `RECURSE` | 261 | Antwort von Upstream-Server (rekursive Aufloesung) |
+| `RECURSE_TIMEOUT` | 262 | Rekursive Anfrage Timeout |
 | `DYN_UPDATE` | 263 | Dynamic DNS Update empfangen |
 | `DYN_UPDATE_RESP` | 264 | Dynamic DNS Update Antwort |
 | `CNAME_LOOKUP` | 279 | Interner CNAME-Lookup (Aufloesung eines CNAME-Ziels) |
@@ -162,6 +168,8 @@ Bekannte Payloads (Auswahl):
 | `interface_index` | INTEGER | Netzwerk-Interface Index |
 | `error_category` | TEXT | Fehler-Kategorie: `CONFIG_ERROR`, `CLIENT_ERROR`, oder NULL |
 | `raw_payload` | TEXT | JSON mit ETW-Payload (nur bei unbekannten Events, sonst NULL) |
+| `correlation_id` | INTEGER | Query-Korrelations-ID (QueryBlob) - verknuepft zusammengehoerige Events |
+| `parent_correlation_id` | INTEGER | Parent-Korrelations-ID (ParentBlob) - fuer Sub-Queries bei parallelen Anfragen |
 
 ### Indices
 
@@ -170,6 +178,7 @@ Bekannte Payloads (Auswahl):
 - `idx_query_name` - Suche nach Domain-Namen
 - `idx_query_results` - Suche nach aufgeloesten IPs
 - `idx_error_category` - Filterung nach Fehlertyp
+- `idx_correlation_id` - Gruppierung zusammengehoeriger Events
 
 ### Event-Typen
 
@@ -278,6 +287,28 @@ ORDER BY count DESC
 LIMIT 20;
 ```
 
+### Zusammengehoerige Events einer Query anzeigen (Server)
+
+```sql
+-- Alle Events einer DNS-Anfrage anhand der correlation_id (GUID)
+SELECT timestamp, event_type, client_ip, query_name, response_code, resolved_ips, xid
+FROM dns_events
+WHERE correlation_id = '{C843EB66-A5B2-4D86-88A1-C1C19ABF24E6}'
+ORDER BY timestamp;
+```
+
+### Rekursions-Kette verfolgen (Server)
+
+```sql
+-- Zeigt den Rekursions-Pfad einer Anfrage
+SELECT
+    timestamp, event_type, query_name, client_ip,
+    xid, qxid, response_code, resolved_ips
+FROM dns_events
+WHERE correlation_id = '{C843EB66-A5B2-4D86-88A1-C1C19ABF24E6}'
+ORDER BY timestamp;
+```
+
 ### Anfragen pro Prozess (Client)
 
 ```sql
@@ -286,6 +317,46 @@ FROM dns_events
 WHERE event_type = 'QUERY'
 GROUP BY process_name
 ORDER BY count DESC;
+```
+
+### Zusammengehoerige Events einer Query anzeigen (Client)
+
+```sql
+-- Alle Events einer DNS-Anfrage anhand der correlation_id
+SELECT timestamp, event_type, query_name, status, query_results
+FROM dns_events
+WHERE correlation_id = 2212822899280
+ORDER BY timestamp;
+```
+
+### Event-Ketten gruppieren (Client)
+
+```sql
+-- Zeigt wie viele Events zu jeder Query gehoeren
+SELECT
+    correlation_id,
+    MIN(query_name) as query,
+    COUNT(*) as event_count,
+    GROUP_CONCAT(event_type, ' -> ') as event_chain,
+    MAX(CASE WHEN status IS NOT NULL AND status != 'NoRecord' THEN status END) as final_status
+FROM dns_events
+WHERE correlation_id IS NOT NULL
+GROUP BY correlation_id
+ORDER BY MIN(timestamp) DESC
+LIMIT 20;
+```
+
+### Sub-Queries finden (Client)
+
+```sql
+-- Zeigt parallele Netzwerk-Anfragen (haben parent_correlation_id)
+SELECT
+    timestamp, event_type, query_name, status,
+    correlation_id, parent_correlation_id
+FROM dns_events
+WHERE parent_correlation_id IS NOT NULL
+ORDER BY timestamp DESC
+LIMIT 20;
 ```
 
 ### Fehler-Statistik (beide)

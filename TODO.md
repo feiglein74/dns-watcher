@@ -3,6 +3,7 @@
 ## Priorität 1 - Wichtig
 
 ### Beide Tools
+- [ ] Upgrade auf `net8.0` (net6.0 wird nicht mehr unterstützt)
 - [ ] `--quiet` Option für Server-Betrieb (nur SQLite/Logfile, keine Console)
 - [ ] Filter-Optionen
   - `--domain=PATTERN` (z.B. `--domain=*.google.com`)
@@ -16,6 +17,11 @@
 ### DnsClientWatcher
 - [ ] Prozess-Tracking: Welcher Prozess hat die DNS-Anfrage gemacht
 - [ ] `--no-cache` Option um Cache-Events zu unterdrücken
+- [ ] `status` Spalte umbenennen in `rcode` (Konsistenz mit DnsServerWatcher)
+- [ ] Class-Feld aus DNS-Response extrahieren und speichern
+- [ ] Protocol-Feld hinzufuegen (TCP, UDP, DoH, DoT)
+- [ ] Response-Type-Feld hinzufuegen (Cached, Authoritative, Recursive)
+- [ ] Robustes Crash-Handling (automatischer Neustart, Fehler-Logging)
 
 ### DnsServerWatcher
 - [ ] CONFIG Events (65208-65279) analysieren und dokumentieren
