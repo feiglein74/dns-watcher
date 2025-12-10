@@ -1,5 +1,24 @@
 # TODO
 
+## Priorität 0 - Housekeeping
+
+### Git-Bereinigung
+- [ ] `DnsClientWatcher/DnsClientWatcher.sln` committen oder entfernen (redundant zur Solution im Root)
+- [ ] `analyze-db.csx` committen oder in .gitignore aufnehmen
+- [ ] SQLite WAL-Dateien in .gitignore ergänzen (`*.db-shm`, `*.db-wal`, `*.db-journal`)
+
+### Code-Organisation
+- [ ] Shared Library für gemeinsamen Code (CLI-Parsing, SQLite-Logic, Formatierung)
+- [ ] Integration Tests für ETW-Funktionalität
+
+### Code-Qualität & CI/CD
+- [ ] Code Coverage aktivieren (`dotnet test --collect:"XPlat Code Coverage"`)
+- [ ] Coverage-Threshold definieren (z.B. min. 70%)
+- [ ] Security Audit in Build integrieren (`dotnet list package --vulnerable`)
+- [ ] GitHub Actions Workflow für automatische Tests bei Push/PR
+- [ ] Mutation Testing evaluieren (Stryker.NET)
+- [ ] Architektur-Tests evaluieren (ArchUnitNET)
+
 ## Priorität 1 - Wichtig
 
 ### Beide Tools
@@ -32,6 +51,7 @@
 ## Priorität 2 - Nice to Have
 
 ### Beide Tools
+- [ ] SBOM generieren (CycloneDX: `dotnet CycloneDX DNS-ETW.sln -o sbom.json -j`)
 - [ ] Statistik-Zusammenfassung bei Ctrl+C (Top 10 Domains, etc.)
 - [ ] CSV-Export-Modus
 - [ ] Syslog-Output für zentrale Log-Server
